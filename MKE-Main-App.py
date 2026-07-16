@@ -1,21 +1,18 @@
+import streamlit as st
 import pandas as pd
 import numpy as np
-import re
 
-def transform_territory_data(analysis_csv_path, export_csv_path, output_csv_path):
+def transform_territory_data(analysis_file, export_file):
     """
-    Transforms a Territory Analysis CSV into a valid NWS Address Import CSV.
+    Transforms uploaded Territory Analysis and Export CSVs into a valid NWS Address Import DataFrame.
     """
-    print("Loading data files...")
-    # Load input DataFrames
-    analysis_df = pd.read_csv(analysis_csv_path)
-    export_df = pd.read_csv(export_csv_path)
+    # Load DataFrames directly from the uploaded files
+    analysis_df = pd.read_csv(analysis_file)
+    export_df = pd.read_csv(export_file)
 
     # ---------------------------------------------------------
     # RULE 1: Composite Matching & Linkage
     # ---------------------------------------------------------
-    print("Parsing territory names and merging reference keys...")
-    
     # Split 'Territory Name' (e.g., 'IR-1') into CategoryCode and TerritoryNumber
     analysis_df[['CategoryCode', 'TerritoryNumber']] = analysis_df['Territory Name'].str.split('-', expand=True)
     
@@ -35,9 +32,6 @@ def transform_territory_data(analysis_csv_path, export_csv_path, output_csv_path
     # ---------------------------------------------------------
     # RULE 2: Address Normalization
     # ---------------------------------------------------------
-    print("Normalizing addresses...")
-    
-    # Extract Suburb (City) from 'Mailable Address' (Assumes format: "1303 N 57TH ST, Milwaukee, WI 53208")
     def extract_city(address):
         if pd.isna(address):
             return ""
@@ -47,7 +41,7 @@ def transform_territory_data(analysis_csv_path, export_csv_path, output_csv_path
         return ""
 
     merged_df['Suburb'] = merged_df['Mailable Address'].apply(extract_city)
-    merged_df['State'] = 'WI' # Defaulting state to WI per instructions
+    merged_df['State'] = 'WI' # Defaulting state to WI
     
     # Extract the purely numeric base from 'HouseNo' (e.g., '1339A' -> '1339')
     merged_df['Base_HouseNo'] = merged_df['HouseNo'].astype(str).str.extract(r'^(\d+)')
@@ -55,19 +49,16 @@ def transform_territory_data(analysis_csv_path, export_csv_path, output_csv_path
     # ---------------------------------------------------------
     # RULE 3: Strict Conditional Apartment vs House Logic
     # ---------------------------------------------------------
-    print("Applying Apartment/Duplex threshold rules...")
-    
     final_rows = []
     
-    # Define a helper to construct a clean baseline NWS row
     def create_nws_row(row_data):
         return {
             'TerritoryID': row_data.get('TerritoryID', ''),
             'TerritoryNumber': row_data.get('TerritoryNumber', ''),
             'CategoryCode': row_data.get('CategoryCode', ''),
             'Category': row_data.get('Category', ''),
-            'TerritoryAddressID': '',              # System default
-            'TerritoryAddressApartmentID': '',     # System default
+            'TerritoryAddressID': '',              
+            'TerritoryAddressApartmentID': '',     
             'ApartmentNumber': '',
             'Number': '',
             'Street': row_data.get('Street', ''),
@@ -77,8 +68,8 @@ def transform_territory_data(analysis_csv_path, export_csv_path, output_csv_path
             'Name': '',
             'Phone': '',
             'Type': '',
-            'Status': 'Available',                 # System default
-            'NotHomeAttempt': 0                    # System default
+            'Status': 'Available',                 
+            'NotHomeAttempt': 0                    
         }
 
     # Group by Street and Base House Number to evaluate the "Threshold of 3"
@@ -90,17 +81,17 @@ def transform_territory_data(analysis_csv_path, export_csv_path, output_csv_path
             for _, row in group.iterrows():
                 nws_row = create_nws_row(row)
                 nws_row['Type'] = 'House'
-                nws_row['Number'] = row['HouseNo'] # Keep specific format (e.g., '1339a')
+                nws_row['Number'] = row['HouseNo']
                 final_rows.append(nws_row)
                 
         else:
             # RULE B: Multi-Family Protocol (3 or more variations)
-            first_row = group.iloc[0] # Grab the first row to copy base territory data
+            first_row = group.iloc[0]
             
             # 1. Generate the Parent Row
             parent_row = create_nws_row(first_row)
             parent_row['Type'] = 'Apartment'
-            parent_row['Number'] = base_no # Base number only (e.g., '1339')
+            parent_row['Number'] = base_no 
             final_rows.append(parent_row)
             
             # 2. Generate the Child Rows
@@ -109,7 +100,6 @@ def transform_territory_data(analysis_csv_path, export_csv_path, output_csv_path
                 child_row['Type'] = 'Apartment'
                 child_row['Number'] = base_no
                 
-                # Determine the best apartment designation (Use 'Unit' col if exists, else the raw HouseNo string)
                 if 'Unit' in row and pd.notna(row['Unit']) and str(row['Unit']).strip() != '':
                     child_row['ApartmentNumber'] = str(row['Unit'])
                 else:
@@ -120,12 +110,8 @@ def transform_territory_data(analysis_csv_path, export_csv_path, output_csv_path
     # ---------------------------------------------------------
     # RULE 4: Final Output Layout
     # ---------------------------------------------------------
-    print("Formatting final output schema...")
-    
-    # Convert list of dictionaries back to a DataFrame
     output_df = pd.DataFrame(final_rows)
     
-    # Enforce exact column order required by NWS
     nws_columns = [
         'TerritoryID', 'TerritoryNumber', 'CategoryCode', 'Category', 
         'TerritoryAddressID', 'TerritoryAddressApartmentID', 'ApartmentNumber', 
@@ -133,20 +119,44 @@ def transform_territory_data(analysis_csv_path, export_csv_path, output_csv_path
         'Name', 'Phone', 'Type', 'Status', 'NotHomeAttempt'
     ]
     
-    # Reindex to guarantee only these columns exist, in this exact order
     output_df = output_df.reindex(columns=nws_columns)
-    
-    # Export to CSV
-    output_df.to_csv(output_csv_path, index=False)
-    print(f"Success! NWS Address Import saved to: {output_csv_path}")
+    return output_df
 
 # ==========================================
-# Execution Block (How to run the script)
+# Streamlit Web Interface
 # ==========================================
-if __name__ == "__main__":
-    # Replace these filenames with your actual local file paths
-    ANALYSIS_FILE = 'Territory_Analysis.csv'
-    EXPORT_FILE = 'Territory_Export.csv'
-    OUTPUT_FILE = 'NWS_Address_Import_Ready.csv'
-    
-    transform_territory_data(ANALYSIS_FILE, EXPORT_FILE, OUTPUT_FILE)
+st.set_page_config(page_title="NWS Address Importer", page_icon="🗺️")
+
+st.title("🗺️ NWS Address Import Generator")
+st.write("Upload your standardized Territory Analysis and the NWS Territory Export to generate a ready-to-import CSV.")
+
+# Create the upload boxes for the user
+col1, col2 = st.columns(2)
+with col1:
+    uploaded_analysis = st.file_uploader("1. Upload Territory Analysis CSV", type="csv")
+with col2:
+    uploaded_export = st.file_uploader("2. Upload NWS Territory Export CSV", type="csv")
+
+# Only show the generate button if BOTH files are uploaded
+if uploaded_analysis and uploaded_export:
+    st.divider()
+    if st.button("Generate NWS Import File", type="primary"):
+        with st.spinner("Processing addresses and formatting for NWS..."):
+            try:
+                # Pass the uploaded files directly into our engine
+                final_dataset = transform_territory_data(uploaded_analysis, uploaded_export)
+                
+                # Convert the result into a downloadable CSV string
+                csv_data = final_dataset.to_csv(index=False).encode('utf-8')
+                
+                st.success("✅ Transformation Complete! Your file is ready.")
+                
+                # Provide the download button
+                st.download_button(
+                    label="⬇️ Download Final NWS Import CSV",
+                    data=csv_data,
+                    file_name='NWS_Address_Import_Ready.csv',
+                    mime='text/csv',
+                )
+            except Exception as e:
+                st.error(f"An error occurred during processing: {e}")
