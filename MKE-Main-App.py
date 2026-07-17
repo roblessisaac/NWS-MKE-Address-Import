@@ -10,6 +10,14 @@ def transform_territory_data(analysis_file, export_file):
     analysis_df = pd.read_csv(analysis_file)
     export_df = pd.read_csv(export_file)
 
+    # Clean column names to remove invisible Excel characters (BOM) and extra spaces
+    analysis_df.columns = analysis_df.columns.str.replace('\ufeff', '').str.strip()
+    export_df.columns = export_df.columns.str.replace('\ufeff', '').str.strip()
+    
+    # Validate that the correct CSV tab was uploaded
+    if 'Territory Name' not in analysis_df.columns:
+        raise ValueError("Could not find the 'Territory Name' column. Please ensure you uploaded the 'Address List' CSV tab, not the Dashboard.")
+
     # ---------------------------------------------------------
     # RULE 1: Composite Matching & Linkage
     # ---------------------------------------------------------
