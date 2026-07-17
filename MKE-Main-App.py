@@ -40,11 +40,22 @@ def transform_territory_data(analysis_file, export_file):
             return parts[1].strip()
         return ""
 
-    merged_df['Suburb'] = merged_df['Mailable Address'].apply(extract_city)
+    # Utilize the newly added 'Muni' field if present, otherwise fallback to the extractor
+    if 'Muni' in merged_df.columns:
+        merged_df['Suburb'] = merged_df['Muni']
+    else:
+        merged_df['Suburb'] = merged_df['Mailable Address'].apply(extract_city)
+        
     merged_df['State'] = 'WI' # Defaulting state to WI
     
-    # Extract the purely numeric base from 'HouseNo' (e.g., '1339A' -> '1339')
-    merged_df['Base_HouseNo'] = merged_df['HouseNo'].astype(str).str.extract(r'^(\d+)')
+    # Combine HouseNo and newly added HouseSx for easy processing
+    if 'HouseSx' in merged_df.columns:
+        merged_df['Full_HouseNo'] = merged_df['HouseNo'].astype(str).str.replace(r'\.0$', '', regex=True) + merged_df['HouseSx'].fillna('').astype(str)
+    else:
+        merged_df['Full_HouseNo'] = merged_df['HouseNo'].astype(str).str.replace(r'\.0$', '', regex=True)
+    
+    # Extract the purely numeric base from the combined house number (e.g., '1339A' -> '1339')
+    merged_df['Base_HouseNo'] = merged_df['Full_HouseNo'].astype(str).str.extract(r'^(\d+)')
 
     # ---------------------------------------------------------
     # RULE 3: Strict Conditional Apartment vs House Logic
@@ -58,7 +69,6 @@ def transform_territory_data(analysis_file, export_file):
             'CategoryCode': row_data.get('CategoryCode', ''),
             'Category': row_data.get('Category', ''),
             'TerritoryAddressID': '',              
-            'TerritoryAddressApartmentID': '',     
             'ApartmentNumber': '',
             'Number': '',
             'Street': row_data.get('Street', ''),
@@ -69,7 +79,17 @@ def transform_territory_data(analysis_file, export_file):
             'Phone': '',
             'Type': '',
             'Status': 'Available',                 
-            'NotHomeAttempt': 0                    
+            'NotHomeAttempt': 0,
+            'Date1': '',
+            'Date2': '',
+            'Date3': '',
+            'Date4': '',
+            'Date5': '',
+            'Language': '',
+            'Latitude': row_data.get('Latitude', ''),
+            'Longitude': row_data.get('Longitude', ''),
+            'Notes': '',
+            'NotesFromPublisher': ''
         }
 
     # Group by Street and Base House Number to evaluate the "Threshold of 3"
@@ -81,7 +101,7 @@ def transform_territory_data(analysis_file, export_file):
             for _, row in group.iterrows():
                 nws_row = create_nws_row(row)
                 nws_row['Type'] = 'House'
-                nws_row['Number'] = row['HouseNo']
+                nws_row['Number'] = row['Full_HouseNo']
                 final_rows.append(nws_row)
                 
         else:
@@ -100,10 +120,14 @@ def transform_territory_data(analysis_file, export_file):
                 child_row['Type'] = 'Apartment'
                 child_row['Number'] = base_no
                 
+                # FORCE apartment children to share the single logical coordinate of the parent
+                child_row['Latitude'] = parent_row['Latitude']
+                child_row['Longitude'] = parent_row['Longitude']
+                
                 if 'Unit' in row and pd.notna(row['Unit']) and str(row['Unit']).strip() != '':
                     child_row['ApartmentNumber'] = str(row['Unit'])
                 else:
-                    child_row['ApartmentNumber'] = str(row['HouseNo'])
+                    child_row['ApartmentNumber'] = str(row['Full_HouseNo'])
                 
                 final_rows.append(child_row)
 
@@ -114,9 +138,11 @@ def transform_territory_data(analysis_file, export_file):
     
     nws_columns = [
         'TerritoryID', 'TerritoryNumber', 'CategoryCode', 'Category', 
-        'TerritoryAddressID', 'TerritoryAddressApartmentID', 'ApartmentNumber', 
-        'Number', 'Street', 'Suburb', 'PostalCode', 'State', 
-        'Name', 'Phone', 'Type', 'Status', 'NotHomeAttempt'
+        'TerritoryAddressID', 'ApartmentNumber', 'Number', 
+        'Street', 'Suburb', 'PostalCode', 'State', 
+        'Name', 'Phone', 'Type', 'Status', 'NotHomeAttempt',
+        'Date1', 'Date2', 'Date3', 'Date4', 'Date5', 'Language',
+        'Latitude', 'Longitude', 'Notes', 'NotesFromPublisher'
     ]
     
     output_df = output_df.reindex(columns=nws_columns)
