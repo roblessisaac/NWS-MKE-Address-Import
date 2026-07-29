@@ -558,7 +558,387 @@ def create_nws_row(row):
     }
 
 
+
+def extract_congregation_name(analysis_file):
+    """
+    Extract the congregation name from the standardized Analysis filename:
+
+        Congregation Name-TerritoryAnalysis-YYYY-MM-DD.xlsx
+    """
+    filename = Path(getattr(analysis_file, "name", "")).stem
+    match = re.fullmatch(
+        r"(?P<congregation>.+?)-TerritoryAnalysis-\d{4}-\d{2}-\d{2}",
+        filename,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        raise ImportValidationError(
+            "The Territory Analysis filename must follow this format: "
+            "'Congregation Name-TerritoryAnalysis-YYYY-MM-DD.xlsx'."
+        )
+
+    congregation_name = match.group("congregation").strip()
+    if not congregation_name:
+        raise ImportValidationError(
+            "The Territory Analysis filename does not contain a congregation name."
+        )
+    return congregation_name
+
+
+def build_full_address(audit_df):
+    """
+    Build a readable address from the structured Analysis fields.
+
+    Missing pieces are skipped so excluded rows still receive the most complete
+    address possible without producing literal NaN values.
+    """
+    def build_row(row):
+        house_number = clean_scalar(row.get("Full House Number", ""))
+        street = clean_scalar(row.get("Full Street", ""))
+        municipality = clean_scalar(row.get("Municipality", ""))
+        state = clean_scalar(row.get("State", ""))
+        postal_code = clean_scalar(row.get("ZIP Code", ""))
+        unit_identifier = clean_scalar(row.get("Derived Unit Identifier", ""))
+
+        street_parts = [part for part in [house_number, street] if part]
+        street_line = " ".join(street_parts)
+        if unit_identifier:
+            street_line = (
+                f"{street_line}, {unit_identifier}"
+                if street_line
+                else unit_identifier
+            )
+
+        locality_line = " ".join(
+            part for part in [state, postal_code] if part
+        )
+        if municipality and locality_line:
+            locality_line = f"{municipality}, {locality_line}"
+        elif municipality:
+            locality_line = municipality
+
+        return ", ".join(
+            part for part in [street_line, locality_line] if part
+        )
+
+    return audit_df.apply(build_row, axis=1)
+
+
+def prepare_audit_sheet_dataframe(audit_df):
+    """
+    Insert Full Address as Column B and move the original Column B to the end.
+    """
+    result = audit_df.copy()
+    original_columns = result.columns.tolist()
+
+    if not original_columns:
+        return result
+
+    original_second_column = (
+        original_columns[1] if len(original_columns) > 1 else None
+    )
+    first_column = original_columns[0]
+
+    result.insert(1, "Full Address", build_full_address(result))
+
+    reordered_columns = [first_column, "Full Address"]
+    reordered_columns.extend(
+        column
+        for column in original_columns
+        if column not in {first_column, original_second_column}
+    )
+    if original_second_column is not None:
+        reordered_columns.append(original_second_column)
+
+    return result[reordered_columns]
+
+
+def write_rich_sentence(worksheet, row, segments, formats):
+    """
+    Write a sentence containing selectively bold text.
+
+    segments is a sequence of (text, is_bold) tuples.
+    """
+    rich_parts = []
+    for text, is_bold in segments:
+        rich_parts.extend(
+            [formats["bold"] if is_bold else formats["normal"], str(text)]
+        )
+
+    worksheet.write_rich_string(
+        row,
+        0,
+        *rich_parts,
+        formats["normal"],
+    )
+
+
+def build_audit_workbook(
+    congregation_name,
+    stats,
+    included_audit,
+    excluded_audit,
+    exclusion_summary,
+):
+    """Generate the three-tab formatted NWS audit workbook."""
+    included_sheet_df = prepare_audit_sheet_dataframe(included_audit)
+    excluded_sheet_df = prepare_audit_sheet_dataframe(excluded_audit)
+
+    input_count = int(stats["input_address_rows"])
+    included_count = int(len(included_audit))
+    excluded_count = int(len(excluded_audit))
+    included_percent = (
+        included_count / input_count * 100 if input_count else 0
+    )
+    excluded_percent = (
+        excluded_count / input_count * 100 if input_count else 0
+    )
+
+    audit_buffer = io.BytesIO()
+    with pd.ExcelWriter(audit_buffer, engine="xlsxwriter") as writer:
+        workbook = writer.book
+
+        # --------------------------------------------------------------
+        # Shared formats
+        # --------------------------------------------------------------
+        title_format = workbook.add_format(
+            {
+                "bold": True,
+                "font_size": 16,
+                "align": "left",
+                "valign": "vcenter",
+            }
+        )
+        heading_format = workbook.add_format({"bold": True})
+        normal_format = workbook.add_format(
+            {"align": "left", "valign": "top"}
+        )
+        bold_format = workbook.add_format(
+            {"bold": True, "align": "left", "valign": "top"}
+        )
+        table_header_format = workbook.add_format(
+            {
+                "bold": True,
+                "bg_color": "#046A34",
+                "font_color": "#EAECEB",
+                "align": "center",
+                "valign": "vcenter",
+                "text_wrap": False,
+            }
+        )
+        table_body_format = workbook.add_format(
+            {
+                "align": "left",
+                "valign": "top",
+                "text_wrap": False,
+            }
+        )
+        formats = {"normal": normal_format, "bold": bold_format}
+
+        # --------------------------------------------------------------
+        # Tab 1: Summary
+        # --------------------------------------------------------------
+        summary_sheet = workbook.add_worksheet("Summary")
+        writer.sheets["Summary"] = summary_sheet
+        summary_sheet.set_tab_color("#000000")
+        summary_sheet.set_column_pixels("A:A", 620)
+        summary_sheet.set_column_pixels("B:B", 125)
+        summary_sheet.set_row(0, 24)
+
+        row = 0
+        summary_sheet.write(
+            row,
+            0,
+            f"{congregation_name} NWS Import Auditing Report",
+            title_format,
+        )
+        row += 2
+
+        summary_sheet.write(row, 0, "SUMMARY:", heading_format)
+        row += 2
+
+        summary_sheet.write(
+            row,
+            0,
+            f"{input_count:,} address rows were pulled from your Territory Analysis file:",
+            normal_format,
+        )
+        row += 2
+
+        summary_sheet.write(
+            row,
+            0,
+            (
+                f"{included_count:,} source rows were included in the NWS "
+                f"import process ({included_percent:.3f}% included)."
+            ),
+            normal_format,
+        )
+        row += 2
+
+        summary_sheet.write(
+            row,
+            0,
+            (
+                f"{excluded_count:,} source rows were excluded because required "
+                f"address information was missing or invalid "
+                f"({excluded_percent:.3f}% excluded)."
+            ),
+            normal_format,
+        )
+        row += 2
+
+        summary_sheet.write(row, 0, "Included Addresses:", heading_format)
+        row += 2
+
+        write_rich_sentence(
+            summary_sheet,
+            row,
+            [
+                (f"{stats['house_rows']:,}", True),
+                (" rows were processed as houses.", False),
+            ],
+            formats,
+        )
+        row += 2
+
+        write_rich_sentence(
+            summary_sheet,
+            row,
+            [
+                (
+                    f"The importer found {stats['apartment_buildings']:,} "
+                    "apartment buildings containing ",
+                    False,
+                ),
+                (f"{stats['apartment_child_rows']:,}", True),
+                (" apartment-unit rows.", False),
+            ],
+            formats,
+        )
+        row += 2
+
+        write_rich_sentence(
+            summary_sheet,
+            row,
+            [
+                ("The importer absorbed ", False),
+                (f"{stats['source_parent_rows_ignored']:,}", True),
+                (
+                    " existing apartment-building parent rows and generated "
+                    "standardized parent rows for the apartment buildings, ",
+                    False,
+                ),
+                ("so no source addresses were lost.", True),
+            ],
+            formats,
+        )
+        row += 2
+
+        summary_sheet.write(
+            row,
+            0,
+            (
+                f"The final NWS import file contains "
+                f"{stats['total_export_rows']:,} rows, including "
+                f"{stats['apartment_parent_rows']:,} generated apartment "
+                "parent rows."
+            ),
+            normal_format,
+        )
+        row += 2
+
+        summary_sheet.write(
+            row,
+            0,
+            f"Excluded Addresses — {excluded_count:,} TOTAL:",
+            heading_format,
+        )
+        row += 2
+
+        exclusion_table_start = row
+        exclusion_summary.to_excel(
+            writer,
+            sheet_name="Summary",
+            index=False,
+            startrow=exclusion_table_start,
+        )
+        summary_sheet.write_row(
+            exclusion_table_start,
+            0,
+            exclusion_summary.columns.tolist(),
+            table_header_format,
+        )
+        if not exclusion_summary.empty:
+            summary_sheet.set_row(
+                exclusion_table_start,
+                None,
+                table_header_format,
+            )
+            summary_sheet.set_column_pixels("A:A", 620, table_body_format)
+            summary_sheet.set_column_pixels("B:B", 125, table_body_format)
+
+        footer_row = exclusion_table_start + len(exclusion_summary) + 3
+        summary_sheet.write(
+            footer_row,
+            0,
+            (
+                "To review the specific excluded addresses, open the "
+                "'Excluded Addresses' tab; to include them in a future import, "
+                "correct the listed issues in your Territory Analysis Excel "
+                "report and regenerate the file."
+            ),
+            normal_format,
+        )
+
+        # --------------------------------------------------------------
+        # Shared detailed-sheet writer
+        # --------------------------------------------------------------
+        def write_detail_sheet(sheet_name, dataframe, tab_color):
+            dataframe.to_excel(
+                writer,
+                sheet_name=sheet_name,
+                index=False,
+            )
+            worksheet = writer.sheets[sheet_name]
+            worksheet.set_tab_color(tab_color)
+            worksheet.freeze_panes(1, 2)
+
+            worksheet.write_row(
+                0,
+                0,
+                dataframe.columns.tolist(),
+                table_header_format,
+            )
+            worksheet.set_row(0, None, table_header_format)
+
+            for column_index, column_name in enumerate(dataframe.columns):
+                width_pixels = 350 if column_name == "Full Address" else 125
+                worksheet.set_column_pixels(
+                    column_index,
+                    column_index,
+                    width_pixels,
+                    table_body_format,
+                )
+
+        # --------------------------------------------------------------
+        # Tab 2 and Tab 3
+        # --------------------------------------------------------------
+        write_detail_sheet(
+            "Excluded Addresses",
+            excluded_sheet_df,
+            "#F4CCCC",
+        )
+        write_detail_sheet(
+            "Included Addresses",
+            included_sheet_df,
+            "#D9EAD3",
+        )
+
+    return audit_buffer.getvalue()
+
 def transform_territory_data(analysis_file, export_file):
+    congregation_name = extract_congregation_name(analysis_file)
     address_raw, apartments_raw = read_analysis_workbook(analysis_file)
     export_raw = read_nws_export(export_file)
 
@@ -971,27 +1351,16 @@ def transform_territory_data(analysis_file, export_file):
     stats["included_address_rows"] = len(included_audit)
     stats["excluded_address_rows"] = len(excluded_audit)
 
-    audit_buffer = io.BytesIO()
-    with pd.ExcelWriter(audit_buffer, engine="openpyxl") as writer:
-        process_summary.to_excel(writer, sheet_name="Summary", index=False)
-        exclusion_summary.to_excel(
-            writer,
-            sheet_name="Summary",
-            index=False,
-            startrow=len(process_summary) + 3,
-        )
-        included_audit.to_excel(
-            writer,
-            sheet_name="Included Addresses",
-            index=False,
-        )
-        excluded_audit.to_excel(
-            writer,
-            sheet_name="Excluded Addresses",
-            index=False,
-        )
+    audit_workbook = build_audit_workbook(
+        congregation_name=congregation_name,
+        stats=stats,
+        included_audit=included_audit,
+        excluded_audit=excluded_audit,
+        exclusion_summary=exclusion_summary,
+    )
+    audit_filename = f"{congregation_name}_NWS_Audit.xlsx"
 
-    return output_df, stats, audit_buffer.getvalue()
+    return output_df, stats, audit_workbook, audit_filename
 
 
 # =====================================================================
@@ -1012,6 +1381,7 @@ st.write(
 SESSION_KEYS = [
     "nws_csv_data",
     "nws_audit_csv",
+    "nws_audit_filename",
     "nws_stats",
     "nws_processing_success",
 ]
@@ -1039,13 +1409,20 @@ if not st.session_state.nws_processing_success:
         if st.button("Generate NWS Import File", type="primary"):
             with st.spinner("Validating territory mappings, addresses, and apartment buildings..."):
                 try:
-                    final_dataset, stats, audit_workbook = transform_territory_data(
-                        uploaded_analysis, uploaded_export
+                    (
+                        final_dataset,
+                        stats,
+                        audit_workbook,
+                        audit_filename,
+                    ) = transform_territory_data(
+                        uploaded_analysis,
+                        uploaded_export,
                     )
                     st.session_state.nws_csv_data = final_dataset.to_csv(
                         index=False
                     ).encode("utf-8-sig")
                     st.session_state.nws_audit_csv = audit_workbook
+                    st.session_state.nws_audit_filename = audit_filename
                     st.session_state.nws_stats = stats
                     st.session_state.nws_processing_success = True
                     st.rerun()
@@ -1058,41 +1435,7 @@ if not st.session_state.nws_processing_success:
                     with st.expander("Technical Details"):
                         st.exception(error)
 else:
-    stats = st.session_state.nws_stats
     st.success("NWS import file generated successfully.")
-
-    st.subheader("Process Summary")
-    summary = pd.DataFrame(
-        {
-            "Measure": [
-                "Input Address List rows",
-                "Included source rows",
-                "Excluded source rows",
-                "House rows generated",
-                "Apartment buildings",
-                "Apartment parent rows generated",
-                "Apartment child rows generated",
-                "Source parent rows absorbed",
-                "Excluded apartment buildings",
-                "Excluded apartment source rows",
-                "Total NWS export rows",
-            ],
-            "Count": [
-                stats["input_address_rows"],
-                stats["included_address_rows"],
-                stats["excluded_address_rows"],
-                stats["house_rows"],
-                stats["apartment_buildings"],
-                stats["apartment_parent_rows"],
-                stats["apartment_child_rows"],
-                stats["source_parent_rows_ignored"],
-                stats["excluded_apartment_buildings"],
-                stats["excluded_apartment_rows"],
-                stats["total_export_rows"],
-            ],
-        }
-    )
-    st.dataframe(summary, hide_index=True, use_container_width=True)
 
     st.download_button(
         label="Download NWS Import CSV",
@@ -1102,17 +1445,12 @@ else:
         type="primary",
     )
 
-    with st.expander("Technical Audit File"):
-        st.write(
-            "This optional CSV contains the normalized and matched source rows used "
-            "to generate the NWS import."
-        )
-        st.download_button(
-            label="Download Processing Audit Workbook",
-            data=st.session_state.nws_audit_csv,
-            file_name="NWS_Address_Import_Audit.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+    st.download_button(
+        label="Download NWS Audit Workbook",
+        data=st.session_state.nws_audit_csv,
+        file_name=st.session_state.nws_audit_filename,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
     if st.button("Process New Files"):
         for key in SESSION_KEYS + ["analysis_upload", "export_upload"]:
