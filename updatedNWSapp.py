@@ -1,5 +1,9 @@
-import streamlit as st
+import io
+import re
+from pathlib import Path
+
 import pandas as pd
+import streamlit as st
 
 
 NWS_COLUMNS = [
@@ -31,9 +35,54 @@ NWS_COLUMNS = [
     "NotesFromPublisher",
 ]
 
+ADDRESS_SHEET = "Address List"
+APARTMENT_SHEET = "Apartments"
+
+ADDRESS_COLUMN_ALIASES = {
+    "Territory Name": ["Territory Name"],
+    "Full House Number": ["FullHouNumber", "Full House Number", "Full_HouseNo", "HouseNo"],
+    "Full Street": ["FullStreet", "Full Street", "Street"],
+    "Municipality": ["Municipality", "Muni", "Suburb"],
+    "State": ["State"],
+    "ZIP Code": ["ZipCode", "Zip_Code", "PostalCode"],
+    "House Number Main": ["HouseNoMain", "HouseNo", "Number"],
+    "House Suffix": ["HouseSx"],
+    "Unit Type": ["UnitType"],
+    "Unit": ["Unit", "ApartmentNumber"],
+    "Latitude": ["Latitude"],
+    "Longitude": ["Longitude"],
+    "Mailable Address": ["Mailable Address", "FullAddr"],
+    "Source Record ID": ["Source record ID", "Source Record ID", "Source_Record_ID"],
+    "Data Quality Flag": ["Data Quality Flag"],
+}
+
+REQUIRED_CANONICAL_ADDRESS_COLUMNS = [
+    "Territory Name",
+    "Full House Number",
+    "Full Street",
+    "Municipality",
+    "State",
+    "ZIP Code",
+    "Latitude",
+    "Longitude",
+]
+
+REQUIRED_EXPORT_COLUMNS = ["TerritoryID", "CategoryCode", "Category", "Number"]
+REQUIRED_APARTMENT_COLUMNS = ["Base Address", "Units", "Territory Name"]
+
+
+class ImportValidationError(ValueError):
+    """Expected user-facing validation failure."""
+
+
+def clean_scalar(value):
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in {"nan", "none", "<na>"} else text
+
 
 def clean_text_series(series):
-    """Return trimmed text without pandas NaN or Excel-style .0 endings."""
     return (
         series.fillna("")
         .astype(str)
@@ -43,60 +92,242 @@ def clean_text_series(series):
     )
 
 
-def clean_scalar(value):
-    """Convert a scalar value to clean text without exporting NaN."""
-    if pd.isna(value):
-        return ""
-    text = str(value).strip()
-    return "" if text.lower() in {"nan", "none", "<na>"} else text
-
-
 def sample_values(series, limit=8):
     values = [clean_scalar(value) for value in series.drop_duplicates().tolist()]
     values = [value for value in values if value]
     return ", ".join(values[:limit])
 
 
-def require_columns(df, required, file_label):
+def normalize_header_names(df):
+    df = df.copy()
+    df.columns = (
+        df.columns.astype(str)
+        .str.replace("\ufeff", "", regex=False)
+        .str.strip()
+    )
+    return df
+
+
+def read_uploaded_table(uploaded_file, sheet_name=None):
+    """Read a CSV or Excel upload without relying on the filename alone."""
+    filename = getattr(uploaded_file, "name", "").lower()
+
+    if hasattr(uploaded_file, "seek"):
+        uploaded_file.seek(0)
+
+    if filename.endswith(".csv"):
+        if sheet_name is not None:
+            raise ImportValidationError(
+                "The Territory Analysis must be uploaded as the complete Excel workbook "
+                "because the Apartments sheet is required."
+            )
+        return normalize_header_names(pd.read_csv(uploaded_file, low_memory=False))
+
+    if filename.endswith((".xlsx", ".xlsm", ".xls")):
+        return normalize_header_names(pd.read_excel(uploaded_file, sheet_name=sheet_name))
+
+    raise ImportValidationError("Only CSV and Excel files are supported.")
+
+
+def read_analysis_workbook(analysis_file):
+    filename = getattr(analysis_file, "name", "").lower()
+    if not filename.endswith((".xlsx", ".xlsm", ".xls")):
+        raise ImportValidationError(
+            "Upload the complete Territory Analysis Excel workbook, not an exported CSV. "
+            "The Address List and Apartments sheets are both required."
+        )
+
+    if hasattr(analysis_file, "seek"):
+        analysis_file.seek(0)
+
+    try:
+        workbook = pd.ExcelFile(analysis_file)
+    except Exception as exc:
+        raise ImportValidationError(f"The Territory Analysis workbook could not be opened: {exc}") from exc
+
+    missing_sheets = [
+        sheet for sheet in [ADDRESS_SHEET, APARTMENT_SHEET] if sheet not in workbook.sheet_names
+    ]
+    if missing_sheets:
+        raise ImportValidationError(
+            "The Territory Analysis workbook is missing required sheet(s): "
+            + ", ".join(missing_sheets)
+            + "."
+        )
+
+    address_df = normalize_header_names(pd.read_excel(workbook, sheet_name=ADDRESS_SHEET))
+    apartments_df = normalize_header_names(pd.read_excel(workbook, sheet_name=APARTMENT_SHEET))
+    return address_df, apartments_df
+
+
+def read_nws_export(export_file):
+    filename = getattr(export_file, "name", "").lower()
+
+    if hasattr(export_file, "seek"):
+        export_file.seek(0)
+
+    if filename.endswith(".csv"):
+        return normalize_header_names(pd.read_csv(export_file, low_memory=False))
+
+    if filename.endswith((".xlsx", ".xlsm", ".xls")):
+        try:
+            workbook = pd.ExcelFile(export_file)
+        except Exception as exc:
+            raise ImportValidationError(f"The NWS export workbook could not be opened: {exc}") from exc
+
+        nonempty_candidates = []
+        for sheet_name in workbook.sheet_names:
+            candidate = normalize_header_names(pd.read_excel(workbook, sheet_name=sheet_name))
+            if set(REQUIRED_EXPORT_COLUMNS).issubset(candidate.columns):
+                nonempty_candidates.append((sheet_name, candidate))
+
+        if not nonempty_candidates:
+            raise ImportValidationError(
+                "No sheet in the NWS export contains TerritoryID, CategoryCode, Category, and Number."
+            )
+        if len(nonempty_candidates) > 1:
+            names = ", ".join(name for name, _ in nonempty_candidates)
+            raise ImportValidationError(
+                "Multiple sheets in the NWS export match the required schema. "
+                f"Keep only one export sheet or upload it as CSV. Matching sheets: {names}"
+            )
+        return nonempty_candidates[0][1]
+
+    raise ImportValidationError("The NWS Territory Export must be a CSV or Excel file.")
+
+
+def canonicalize_address_columns(df):
+    """Map the current Analysis Engine schema and supported legacy aliases."""
+    rename_map = {}
+    missing = []
+
+    for canonical, aliases in ADDRESS_COLUMN_ALIASES.items():
+        match = next((alias for alias in aliases if alias in df.columns), None)
+        if match is not None:
+            rename_map[match] = canonical
+        elif canonical in REQUIRED_CANONICAL_ADDRESS_COLUMNS:
+            missing.append(f"{canonical} ({' or '.join(aliases)})")
+
+    if missing:
+        raise ImportValidationError(
+            "The Address List sheet is missing required field(s): " + ", ".join(missing) + "."
+        )
+
+    result = df.rename(columns=rename_map).copy()
+    for optional in ADDRESS_COLUMN_ALIASES:
+        if optional not in result.columns:
+            result[optional] = ""
+    return result
+
+
+def require_columns(df, required, label):
     missing = [column for column in required if column not in df.columns]
     if missing:
-        raise ValueError(
-            f"{file_label} is missing required column(s): {', '.join(missing)}."
+        raise ImportValidationError(
+            f"{label} is missing required column(s): {', '.join(missing)}."
         )
 
 
-def extract_city(address):
-    """Extract the municipality from 'Street, City, WI ZIP' style text."""
-    text = clean_scalar(address)
-    if not text:
-        return ""
-
-    parts = [part.strip() for part in text.split(",")]
-    return parts[1] if len(parts) >= 2 else ""
-
-
-def normalize_postal_code(series):
-    postal = clean_text_series(series)
-    postal = postal.str.replace(r"\s+", "", regex=True)
-
+def normalize_zip(series):
+    postal = clean_text_series(series).str.replace(r"\s+", "", regex=True)
     malformed = postal.ne("") & ~postal.str.fullmatch(r"\d{5}(?:-\d{4})?")
     if malformed.any():
-        examples = sample_values(postal[malformed])
-        raise ValueError(
-            "The Territory Analysis contains malformed postal codes. "
-            f"Examples: {examples}"
+        raise ImportValidationError(
+            "The Address List contains malformed ZIP codes. Examples: "
+            + sample_values(postal[malformed])
         )
-
     return postal
 
 
-def choose_parent_coordinates(group):
-    """
-    Choose a deterministic logical coordinate for an apartment building.
+def normalize_address_component(series):
+    return (
+        clean_text_series(series)
+        .str.upper()
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
 
-    The most common valid coordinate pair is preferred. If every pair occurs
-    once, the first pair after deterministic sorting is used.
-    """
+
+def extract_trailing_territory_number(series, label):
+    text = clean_text_series(series)
+    number_text = text.str.extract(r"(\d+)\s*$", expand=False)
+    invalid = number_text.isna()
+    if invalid.any():
+        raise ImportValidationError(
+            f"Some {label} values do not end in a territory number. Examples: "
+            + sample_values(text[invalid])
+        )
+    return pd.to_numeric(number_text, errors="raise").astype("Int64")
+
+
+def build_building_key(house_number, street, municipality, postal_code):
+    return (
+        normalize_address_component(house_number)
+        + "|"
+        + normalize_address_component(street)
+        + "|"
+        + normalize_address_component(municipality)
+        + "|"
+        + normalize_zip(postal_code)
+    )
+
+
+def parse_apartment_base_addresses(apartments_df):
+    require_columns(apartments_df, REQUIRED_APARTMENT_COLUMNS, "Apartments sheet")
+    apartments = apartments_df.copy()
+    apartments = apartments[
+        clean_text_series(apartments["Base Address"]).ne("")
+    ].copy()
+
+    base_text = clean_text_series(apartments["Base Address"])
+    parsed = base_text.str.extract(
+        r"^\s*(?P<House>\S+)\s+(?P<Street>.*?),\s*(?P<Municipality>.*?),\s*[A-Za-z]{2}\s+(?P<Zip>\d{5}(?:-\d{4})?)\s*$"
+    )
+    invalid = parsed.isna().any(axis=1)
+    if invalid.any():
+        raise ImportValidationError(
+            "Some Apartments sheet Base Address values could not be parsed. Examples: "
+            + sample_values(base_text[invalid])
+        )
+
+    apartments["TerritoryNumber"] = extract_trailing_territory_number(
+        apartments["Territory Name"], "Apartments sheet Territory Name"
+    )
+    apartments["ExpectedUnits"] = pd.to_numeric(apartments["Units"], errors="coerce").astype("Int64")
+    invalid_units = apartments["ExpectedUnits"].isna() | apartments["ExpectedUnits"].lt(1)
+    if invalid_units.any():
+        raise ImportValidationError(
+            "The Apartments sheet contains blank or invalid unit counts. Examples: "
+            + sample_values(apartments.loc[invalid_units, "Base Address"])
+        )
+
+    apartments["BuildingKey"] = build_building_key(
+        parsed["House"], parsed["Street"], parsed["Municipality"], parsed["Zip"]
+    )
+
+    duplicate_keys = apartments.duplicated(
+        subset=["TerritoryNumber", "BuildingKey"], keep=False
+    )
+    if duplicate_keys.any():
+        raise ImportValidationError(
+            "The Apartments sheet contains duplicate building records. Examples: "
+            + sample_values(apartments.loc[duplicate_keys, "Base Address"])
+        )
+
+    return apartments[
+        [
+            "TerritoryNumber",
+            "BuildingKey",
+            "ExpectedUnits",
+            "Base Address",
+            "Blank Parent Rows",
+            "Nonblank Unit Rows",
+            "Duplicate Units",
+        ]
+    ].copy()
+
+
+def choose_parent_coordinates(group):
     coordinates = group[["Latitude", "Longitude"]].dropna()
     if coordinates.empty:
         return "", ""
@@ -115,309 +346,209 @@ def choose_parent_coordinates(group):
     return best["Latitude"], best["Longitude"]
 
 
-def transform_territory_data(analysis_file, export_file, apartment_threshold=3):
-    """
-    Transform a TerritoryToolbox Address List CSV and an NWS territory export
-    into an NWS address-import DataFrame.
-
-    Returns:
-        output_df: Final NWS-formatted data.
-        stats: Processing summary.
-        audit_df: Source rows with derived matching/classification fields.
-    """
-    if apartment_threshold < 3:
-        raise ValueError("Apartment threshold must be at least 3.")
-
-    analysis_df = pd.read_csv(analysis_file, low_memory=False)
-    export_df = pd.read_csv(export_file, low_memory=False)
-
-    analysis_df.columns = (
-        analysis_df.columns.astype(str)
-        .str.replace("\ufeff", "", regex=False)
-        .str.strip()
-    )
-    export_df.columns = (
-        export_df.columns.astype(str)
-        .str.replace("\ufeff", "", regex=False)
-        .str.strip()
-    )
-
-    # ------------------------------------------------------------------
-    # 1. Schema validation
-    # ------------------------------------------------------------------
-    required_analysis = [
-        "Territory Name",
-        "Street",
-        "HouseNo",
-        "Zip_Code",
-        "Latitude",
-        "Longitude",
-    ]
-    required_export = ["CategoryCode", "Number", "TerritoryID", "Category"]
-
-    require_columns(analysis_df, required_analysis, "Territory Analysis CSV")
-    require_columns(export_df, required_export, "NWS Territory Export CSV")
-
-    municipality_sources = {"Muni", "Mailable Address", "FullAddr"}
-    if not municipality_sources.intersection(analysis_df.columns):
-        raise ValueError(
-            "The Territory Analysis CSV must contain Muni, Mailable Address, "
-            "or FullAddr so the NWS Suburb field can be populated."
-        )
-
-    if analysis_df.empty:
-        raise ValueError("The Territory Analysis CSV contains no address rows.")
-    if export_df.empty:
-        raise ValueError("The NWS Territory Export CSV contains no territory rows.")
-
-    analysis_df = analysis_df.copy()
+def prepare_export(export_df):
+    require_columns(export_df, REQUIRED_EXPORT_COLUMNS, "NWS Territory Export")
     export_df = export_df.copy()
-    analysis_df["_SourceRow"] = range(2, len(analysis_df) + 2)
 
-    # ------------------------------------------------------------------
-    # 2. Territory parsing and NWS linkage
-    # ------------------------------------------------------------------
-    territory_name = clean_text_series(analysis_df["Territory Name"]).str.upper()
-    split_cols = territory_name.str.rsplit("-", n=1, expand=True)
-
-    if split_cols.shape[1] != 2:
-        raise ValueError(
-            "Territory names must end with a hyphen and number, such as IR-1."
-        )
-
-    analysis_df["CategoryCode"] = split_cols[0].str.strip()
-    territory_number_text = split_cols[1].str.strip()
-
-    invalid_territories = (
-        analysis_df["CategoryCode"].eq("")
-        | ~territory_number_text.str.fullmatch(r"\d+")
-    )
-    if invalid_territories.any():
-        examples = sample_values(
-            analysis_df.loc[invalid_territories, "Territory Name"]
-        )
-        raise ValueError(
-            "Some Territory Name values could not be parsed. "
-            f"Examples: {examples}. Expected a format ending in '-number'."
-        )
-
-    analysis_df["TerritoryNumber"] = pd.to_numeric(
-        territory_number_text, errors="raise"
-    ).astype("Int64")
-
-    export_df["CategoryCode"] = clean_text_series(
-        export_df["CategoryCode"]
-    ).str.upper()
-    export_number_text = clean_text_series(export_df["Number"])
-
-    invalid_export_numbers = (
-        export_df["CategoryCode"].eq("")
-        | ~export_number_text.str.fullmatch(r"\d+")
-    )
-    if invalid_export_numbers.any():
-        examples = sample_values(
-            export_df.loc[invalid_export_numbers, "Number"]
-        )
-        raise ValueError(
-            "The NWS export contains blank or nonnumeric territory numbers. "
-            f"Examples: {examples}"
-        )
-
-    export_df["Number"] = pd.to_numeric(
-        export_number_text, errors="raise"
-    ).astype("Int64")
+    # Remove completely blank trailing Excel rows before validating.
+    export_df = export_df.dropna(how="all")
     export_df["TerritoryID"] = clean_text_series(export_df["TerritoryID"])
+    export_df["CategoryCode"] = normalize_address_component(export_df["CategoryCode"])
     export_df["Category"] = clean_text_series(export_df["Category"])
 
-    missing_export_ids = export_df["TerritoryID"].eq("")
-    if missing_export_ids.any():
-        raise ValueError(
-            f"The NWS export contains {int(missing_export_ids.sum())} "
-            "territory row(s) without a TerritoryID."
+    number_text = clean_text_series(export_df["Number"])
+    invalid_numbers = ~number_text.str.fullmatch(r"\d+")
+    if invalid_numbers.any():
+        raise ImportValidationError(
+            "The NWS export contains blank or nonnumeric territory numbers. Examples: "
+            + sample_values(number_text[invalid_numbers])
+        )
+    export_df["Number"] = pd.to_numeric(number_text, errors="raise").astype("Int64")
+
+    blank_ids = export_df["TerritoryID"].eq("")
+    if blank_ids.any():
+        raise ImportValidationError(
+            f"The NWS export contains {int(blank_ids.sum())} row(s) without a TerritoryID."
         )
 
-    duplicate_export_keys = export_df.duplicated(
-        subset=["CategoryCode", "Number"], keep=False
-    )
-    if duplicate_export_keys.any():
-        duplicate_keys = (
-            export_df.loc[duplicate_export_keys, ["CategoryCode", "Number"]]
-            .drop_duplicates()
-            .astype(str)
-            .agg("-".join, axis=1)
-        )
-        raise ValueError(
-            "The NWS export contains duplicate CategoryCode/Number keys: "
-            f"{sample_values(duplicate_keys)}"
+    duplicate_ids = export_df["TerritoryID"].duplicated(keep=False)
+    if duplicate_ids.any():
+        raise ImportValidationError(
+            "The NWS export contains duplicate TerritoryID values: "
+            + sample_values(export_df.loc[duplicate_ids, "TerritoryID"])
         )
 
-    merged_df = analysis_df.merge(
-        export_df[required_export],
-        left_on=["CategoryCode", "TerritoryNumber"],
-        right_on=["CategoryCode", "Number"],
-        how="left",
-        validate="many_to_one",
-    )
-
-    unmatched = merged_df["TerritoryID"].isna()
-    if unmatched.any():
-        missing_names = sample_values(
-            merged_df.loc[unmatched, "Territory Name"]
-        )
-        raise ValueError(
-            f"{int(unmatched.sum())} address row(s) could not be matched to "
-            f"the NWS export. Unmatched territories: {missing_names}"
+    # The new Territory Analysis carries only a trailing number, not CategoryCode.
+    # Therefore Number must be globally unique within the supplied export.
+    duplicate_numbers = export_df["Number"].duplicated(keep=False)
+    if duplicate_numbers.any():
+        rows = export_df.loc[duplicate_numbers, ["CategoryCode", "Number"]].astype(str).agg("-".join, axis=1)
+        raise ImportValidationError(
+            "The NWS export reuses the same territory Number in multiple rows, but the "
+            "Territory Analysis no longer contains CategoryCode. Ambiguous keys: "
+            + sample_values(rows)
         )
 
-    # ------------------------------------------------------------------
-    # 3. Address normalization and integrity checks
-    # ------------------------------------------------------------------
-    merged_df["Street"] = (
-        clean_text_series(merged_df["Street"])
-        .str.replace(r"\s+", " ", regex=True)
-        .str.upper()
+    return export_df[REQUIRED_EXPORT_COLUMNS].copy()
+
+
+def create_nws_row(row):
+    territory_number = row.get("TerritoryNumber", "")
+    territory_number = "" if pd.isna(territory_number) else str(int(territory_number))
+
+    return {
+        "TerritoryID": clean_scalar(row.get("TerritoryID", "")),
+        "TerritoryNumber": territory_number,
+        "CategoryCode": clean_scalar(row.get("CategoryCode", "")),
+        "Category": clean_scalar(row.get("Category", "")),
+        "TerritoryAddressID": "",
+        "ApartmentNumber": "",
+        "Number": "",
+        "Street": clean_scalar(row.get("Full Street", "")),
+        "Suburb": clean_scalar(row.get("Municipality", "")),
+        "PostalCode": clean_scalar(row.get("ZIP Code", "")),
+        "State": clean_scalar(row.get("State", "WI")) or "WI",
+        "Name": "",
+        "Phone": "",
+        "Type": "",
+        "Status": "Available",
+        "NotHomeAttempt": 0,
+        "Date1": "",
+        "Date2": "",
+        "Date3": "",
+        "Date4": "",
+        "Date5": "",
+        "Language": "",
+        "Latitude": row.get("Latitude", ""),
+        "Longitude": row.get("Longitude", ""),
+        "Notes": "",
+        "NotesFromPublisher": "",
+    }
+
+
+def transform_territory_data(analysis_file, export_file):
+    address_raw, apartments_raw = read_analysis_workbook(analysis_file)
+    export_raw = read_nws_export(export_file)
+
+    addresses = canonicalize_address_columns(address_raw)
+    export_df = prepare_export(export_raw)
+    apartment_reference = parse_apartment_base_addresses(apartments_raw)
+
+    addresses = addresses.copy()
+    addresses["_SourceRow"] = range(2, len(addresses) + 2)
+    addresses["TerritoryNumber"] = extract_trailing_territory_number(
+        addresses["Territory Name"], "Address List Territory Name"
     )
-    merged_df["HouseNo"] = clean_text_series(merged_df["HouseNo"])
-    merged_df["HouseSx_Clean"] = (
-        clean_text_series(merged_df["HouseSx"])
-        if "HouseSx" in merged_df.columns
-        else ""
+
+    addresses["Full House Number"] = normalize_address_component(addresses["Full House Number"])
+    addresses["Full Street"] = normalize_address_component(addresses["Full Street"])
+    addresses["Municipality"] = normalize_address_component(addresses["Municipality"])
+    addresses["State"] = normalize_address_component(addresses["State"])
+    addresses["ZIP Code"] = normalize_zip(addresses["ZIP Code"])
+    addresses["Unit Type"] = normalize_address_component(addresses["Unit Type"])
+    addresses["Unit"] = normalize_address_component(addresses["Unit"])
+    addresses["Source Record ID"] = clean_text_series(addresses["Source Record ID"])
+    addresses["Data Quality Flag"] = clean_text_series(addresses["Data Quality Flag"])
+
+    addresses["Latitude"] = pd.to_numeric(addresses["Latitude"], errors="coerce")
+    addresses["Longitude"] = pd.to_numeric(addresses["Longitude"], errors="coerce")
+
+    addresses["BuildingKey"] = build_building_key(
+        addresses["Full House Number"],
+        addresses["Full Street"],
+        addresses["Municipality"],
+        addresses["ZIP Code"],
     )
-    merged_df["Full_HouseNo"] = (
-        merged_df["HouseNo"] + merged_df["HouseSx_Clean"]
-    ).str.upper()
 
-    extracted_base = merged_df["Full_HouseNo"].str.extract(r"^(\d+)")[0]
-    merged_df["Base_HouseNo"] = extracted_base.fillna(
-        merged_df["Full_HouseNo"]
-    )
-
-    merged_df["Zip_Code"] = normalize_postal_code(merged_df["Zip_Code"])
-
-    if "Muni" in merged_df.columns:
-        suburb = clean_text_series(merged_df["Muni"])
-    else:
-        suburb = pd.Series("", index=merged_df.index, dtype="object")
-
-    fallback_column = next(
-        (
-            column
-            for column in ["Mailable Address", "FullAddr"]
-            if column in merged_df.columns
+    critical_checks = {
+        "territory name": clean_text_series(addresses["Territory Name"]).eq(""),
+        "house number": addresses["Full House Number"].eq(""),
+        "street": addresses["Full Street"].eq(""),
+        "municipality": addresses["Municipality"].eq(""),
+        "state": addresses["State"].eq(""),
+        "ZIP code": addresses["ZIP Code"].eq(""),
+        "valid coordinates": (
+            addresses["Latitude"].isna()
+            | addresses["Longitude"].isna()
+            | ~addresses["Latitude"].between(-90, 90)
+            | ~addresses["Longitude"].between(-180, 180)
         ),
-        None,
-    )
-    if fallback_column:
-        fallback_suburb = merged_df[fallback_column].apply(extract_city)
-        suburb = suburb.mask(suburb.eq(""), fallback_suburb)
-
-    merged_df["Suburb"] = (
-        clean_text_series(suburb)
-        .str.replace(r"\s+", " ", regex=True)
-        .str.upper()
-    )
-    merged_df["State"] = "WI"
-
-    merged_df["Latitude"] = pd.to_numeric(
-        merged_df["Latitude"], errors="coerce"
-    )
-    merged_df["Longitude"] = pd.to_numeric(
-        merged_df["Longitude"], errors="coerce"
-    )
-
-    invalid_coordinates = (
-        merged_df["Latitude"].isna()
-        | merged_df["Longitude"].isna()
-        | ~merged_df["Latitude"].between(-90, 90)
-        | ~merged_df["Longitude"].between(-180, 180)
-    )
-
-    critical_missing = {
-        "street": merged_df["Street"].eq(""),
-        "house number": merged_df["Full_HouseNo"].eq(""),
-        "municipality": merged_df["Suburb"].eq(""),
-        "postal code": merged_df["Zip_Code"].eq(""),
-        "valid coordinates": invalid_coordinates,
     }
     failures = [
         f"{label}: {int(mask.sum())}"
-        for label, mask in critical_missing.items()
+        for label, mask in critical_checks.items()
         if mask.any()
     ]
     if failures:
-        raise ValueError(
-            "The Territory Analysis contains address rows that cannot produce "
-            "a valid NWS import. " + "; ".join(failures) + "."
+        raise ImportValidationError(
+            "The Address List contains rows that cannot produce a valid NWS import. "
+            + "; ".join(failures)
+            + "."
         )
 
-    if "Unit" in merged_df.columns:
-        merged_df["Explicit_Unit"] = clean_text_series(
-            merged_df["Unit"]
-        ).str.upper()
-    else:
-        merged_df["Explicit_Unit"] = ""
-
-    suffix_unit = pd.Series("", index=merged_df.index, dtype="object")
-    has_numeric_base = extracted_base.notna()
-    suffix_unit.loc[has_numeric_base] = [
-        full[len(base):].strip("- /#")
-        for full, base in zip(
-            merged_df.loc[has_numeric_base, "Full_HouseNo"],
-            merged_df.loc[has_numeric_base, "Base_HouseNo"],
+    flagged = addresses["Data Quality Flag"].ne("")
+    if flagged.any():
+        raise ImportValidationError(
+            f"The Address List contains {int(flagged.sum())} row(s) with Data Quality Flag values. "
+            "Resolve those records in the Analysis Engine before importing. Examples: "
+            + sample_values(addresses.loc[flagged, "Data Quality Flag"])
         )
-    ]
-    merged_df["Suffix_Unit"] = suffix_unit
-    merged_df["Derived_Unit"] = merged_df["Explicit_Unit"].mask(
-        merged_df["Explicit_Unit"].eq(""),
-        merged_df["Suffix_Unit"],
+
+    if addresses["Source Record ID"].ne("").any():
+        duplicate_source_ids = (
+            addresses["Source Record ID"].ne("")
+            & addresses["Source Record ID"].duplicated(keep=False)
+        )
+        if duplicate_source_ids.any():
+            raise ImportValidationError(
+                "The Address List contains duplicate Source Record ID values: "
+                + sample_values(addresses.loc[duplicate_source_ids, "Source Record ID"])
+            )
+
+    addresses = addresses.merge(
+        export_df,
+        left_on="TerritoryNumber",
+        right_on="Number",
+        how="left",
+        validate="many_to_one",
+        suffixes=("", "_Export"),
     )
 
-    duplicate_identity_columns = [
-        "TerritoryID",
-        "Street",
-        "Suburb",
-        "Zip_Code",
-        "Full_HouseNo",
-        "Derived_Unit",
-        "Latitude",
-        "Longitude",
-    ]
-    exact_duplicates = merged_df.duplicated(
-        subset=duplicate_identity_columns, keep=False
+    unmatched = addresses["TerritoryID"].isna()
+    if unmatched.any():
+        raise ImportValidationError(
+            f"{int(unmatched.sum())} Address List row(s) could not be matched to the NWS export. "
+            "Unmatched territories: "
+            + sample_values(addresses.loc[unmatched, "Territory Name"])
+        )
+
+    addresses["IsApartmentBuilding"] = addresses.set_index(
+        ["TerritoryNumber", "BuildingKey"]
+    ).index.isin(
+        apartment_reference.set_index(["TerritoryNumber", "BuildingKey"]).index
     )
-    if exact_duplicates.any():
-        sample_rows = (
-            merged_df.loc[
-                exact_duplicates,
-                ["Territory Name", "Full_HouseNo", "Street", "Derived_Unit"],
-            ]
-            .astype(str)
-            .agg(" | ".join, axis=1)
-        )
-        raise ValueError(
-            f"Found {int(exact_duplicates.sum())} duplicate source rows. "
-            f"Examples: {sample_values(sample_rows)}"
+
+    # Every building listed on Apartments must exist in Address List.
+    present_keys = addresses[["TerritoryNumber", "BuildingKey"]].drop_duplicates()
+    apartment_presence = apartment_reference.merge(
+        present_keys,
+        on=["TerritoryNumber", "BuildingKey"],
+        how="left",
+        indicator=True,
+    )
+    missing_buildings = apartment_presence["_merge"].eq("left_only")
+    if missing_buildings.any():
+        raise ImportValidationError(
+            "Some buildings listed on the Apartments sheet were not found in Address List. Examples: "
+            + sample_values(apartment_presence.loc[missing_buildings, "Base Address"])
         )
 
-    # ------------------------------------------------------------------
-    # 4. House/apartment classification
-    # ------------------------------------------------------------------
-    group_keys = [
-        "TerritoryID",
-        "Street",
-        "Suburb",
-        "Zip_Code",
-        "Base_HouseNo",
-    ]
-
-    merged_df = merged_df.sort_values(
+    addresses = addresses.sort_values(
         [
-            "CategoryCode",
             "TerritoryNumber",
-            "Street",
-            "Base_HouseNo",
-            "Full_HouseNo",
-            "Derived_Unit",
+            "Full Street",
+            "Full House Number",
+            "Unit",
             "_SourceRow",
         ],
         kind="stable",
@@ -425,115 +556,76 @@ def transform_territory_data(analysis_file, export_file, apartment_threshold=3):
 
     final_rows = []
     stats = {
-        "input_addresses": len(merged_df),
-        "houses": 0,
-        "apartment_parents": 0,
-        "apartment_children": 0,
+        "input_address_rows": len(addresses),
+        "house_rows": 0,
         "apartment_buildings": 0,
+        "apartment_parent_rows": 0,
+        "apartment_child_rows": 0,
+        "source_parent_rows_ignored": 0,
     }
 
-    def create_nws_row(row):
-        territory_number = row.get("TerritoryNumber", "")
-        if pd.notna(territory_number):
-            territory_number = str(int(territory_number))
-        else:
-            territory_number = ""
+    group_keys = ["TerritoryID", "TerritoryNumber", "BuildingKey"]
+    apartment_lookup = apartment_reference.set_index(["TerritoryNumber", "BuildingKey"])
 
-        return {
-            "TerritoryID": clean_scalar(row.get("TerritoryID", "")),
-            "TerritoryNumber": territory_number,
-            "CategoryCode": clean_scalar(row.get("CategoryCode", "")),
-            "Category": clean_scalar(row.get("Category", "")),
-            "TerritoryAddressID": "",
-            "ApartmentNumber": "",
-            "Number": "",
-            "Street": clean_scalar(row.get("Street", "")),
-            "Suburb": clean_scalar(row.get("Suburb", "")),
-            "PostalCode": clean_scalar(row.get("Zip_Code", "")),
-            "State": "WI",
-            "Name": "",
-            "Phone": "",
-            "Type": "",
-            "Status": "Available",
-            "NotHomeAttempt": 0,
-            "Date1": "",
-            "Date2": "",
-            "Date3": "",
-            "Date4": "",
-            "Date5": "",
-            "Language": "",
-            "Latitude": row.get("Latitude", ""),
-            "Longitude": row.get("Longitude", ""),
-            "Notes": "",
-            "NotesFromPublisher": "",
-        }
-
-    for _, group in merged_df.groupby(
+    for (_, territory_number, building_key), group in addresses.groupby(
         group_keys, sort=False, dropna=False
     ):
-        base_number = clean_scalar(group["Base_HouseNo"].iloc[0])
-
-        distinct_explicit_units = group.loc[
-            group["Explicit_Unit"].ne(""), "Explicit_Unit"
-        ].nunique()
-        distinct_derived_units = group.loc[
-            group["Derived_Unit"].ne(""), "Derived_Unit"
-        ].nunique()
-
-        is_apartment = (
-            distinct_explicit_units >= apartment_threshold
-            or distinct_derived_units >= apartment_threshold
-        )
-
-        if not is_apartment:
+        if not bool(group["IsApartmentBuilding"].iloc[0]):
             for _, row in group.iterrows():
-                output_row = create_nws_row(row)
-                output_row["Type"] = "House"
-                output_row["Number"] = clean_scalar(row["Full_HouseNo"])
-                final_rows.append(output_row)
-                stats["houses"] += 1
+                output = create_nws_row(row)
+                output["Type"] = "House"
+                output["Number"] = clean_scalar(row["Full House Number"])
+                final_rows.append(output)
+                stats["house_rows"] += 1
             continue
 
-        missing_child_units = group["Derived_Unit"].eq("")
-        if missing_child_units.any():
-            rows = sample_values(group.loc[missing_child_units, "_SourceRow"])
-            raise ValueError(
-                "An apartment-classified building contains child rows without "
-                f"a usable unit number. Source CSV row(s): {rows}"
+        reference = apartment_lookup.loc[(territory_number, building_key)]
+        unit_rows = group[group["Unit"].ne("")].copy()
+        parent_source_rows = group[group["Unit"].eq("")].copy()
+
+        duplicate_units = unit_rows["Unit"].duplicated(keep=False)
+        if duplicate_units.any():
+            raise ImportValidationError(
+                "An apartment building contains duplicate normalized unit values. Building: "
+                + clean_scalar(reference["Base Address"])
+                + ". Units: "
+                + sample_values(unit_rows.loc[duplicate_units, "Unit"])
+            )
+
+        expected_units = int(reference["ExpectedUnits"])
+        actual_units = int(unit_rows["Unit"].nunique())
+        if actual_units != expected_units:
+            raise ImportValidationError(
+                f"Apartment unit-count mismatch for {clean_scalar(reference['Base Address'])}. "
+                f"Apartments sheet: {expected_units}; Address List unique units: {actual_units}."
             )
 
         first_row = group.iloc[0]
         parent_latitude, parent_longitude = choose_parent_coordinates(group)
+        parent = create_nws_row(first_row)
+        parent["Type"] = "Apartment"
+        parent["Number"] = clean_scalar(first_row["Full House Number"])
+        parent["Latitude"] = parent_latitude
+        parent["Longitude"] = parent_longitude
+        final_rows.append(parent)
 
-        parent_row = create_nws_row(first_row)
-        parent_row["Type"] = "Apartment"
-        parent_row["Number"] = base_number
-        parent_row["Latitude"] = parent_latitude
-        parent_row["Longitude"] = parent_longitude
-        final_rows.append(parent_row)
-
-        stats["apartment_parents"] += 1
         stats["apartment_buildings"] += 1
+        stats["apartment_parent_rows"] += 1
+        stats["source_parent_rows_ignored"] += len(parent_source_rows)
 
-        for _, row in group.iterrows():
-            child_row = create_nws_row(row)
-            child_row["Type"] = "Apartment"
-            child_row["Number"] = base_number
-            child_row["ApartmentNumber"] = clean_scalar(
-                row["Derived_Unit"]
-            )
-            child_row["Latitude"] = parent_latitude
-            child_row["Longitude"] = parent_longitude
-            final_rows.append(child_row)
-            stats["apartment_children"] += 1
+        for _, row in unit_rows.iterrows():
+            child = create_nws_row(row)
+            child["Type"] = "Apartment"
+            child["Number"] = clean_scalar(first_row["Full House Number"])
+            child["ApartmentNumber"] = clean_scalar(row["Unit"])
+            child["Latitude"] = parent_latitude
+            child["Longitude"] = parent_longitude
+            final_rows.append(child)
+            stats["apartment_child_rows"] += 1
 
-    # ------------------------------------------------------------------
-    # 5. Final output validation
-    # ------------------------------------------------------------------
-    output_df = pd.DataFrame(final_rows).reindex(columns=NWS_COLUMNS)
-    output_df = output_df.fillna("")
+    output_df = pd.DataFrame(final_rows).reindex(columns=NWS_COLUMNS).fillna("")
 
-    required_output_fields = [
+    required_output = [
         "TerritoryID",
         "TerritoryNumber",
         "CategoryCode",
@@ -547,20 +639,15 @@ def transform_territory_data(analysis_file, export_file, apartment_threshold=3):
         "Latitude",
         "Longitude",
     ]
-    missing_output = {
+    blank_output = {
         column: int(output_df[column].astype(str).str.strip().eq("").sum())
-        for column in required_output_fields
+        for column in required_output
     }
-    missing_output = {
-        column: count for column, count in missing_output.items() if count
-    }
-    if missing_output:
-        details = ", ".join(
-            f"{column}: {count}"
-            for column, count in missing_output.items()
-        )
-        raise ValueError(
-            f"Final output validation failed. Blank required fields: {details}"
+    blank_output = {column: count for column, count in blank_output.items() if count}
+    if blank_output:
+        details = ", ".join(f"{column}: {count}" for column, count in blank_output.items())
+        raise ImportValidationError(
+            "Final output validation failed because required fields are blank: " + details
         )
 
     apartment_children = output_df[
@@ -579,18 +666,38 @@ def transform_territory_data(analysis_file, export_file, apartment_threshold=3):
         keep=False,
     )
     if duplicate_children.any():
-        raise ValueError(
-            f"The final file contains {int(duplicate_children.sum())} "
-            "duplicate apartment child rows."
+        raise ImportValidationError(
+            f"The final file contains {int(duplicate_children.sum())} duplicate apartment child rows."
         )
 
     stats["total_export_rows"] = len(output_df)
-    return output_df, stats, merged_df
+    audit_columns = [
+        "_SourceRow",
+        "Source Record ID",
+        "Territory Name",
+        "TerritoryNumber",
+        "TerritoryID",
+        "CategoryCode",
+        "Full House Number",
+        "Full Street",
+        "Municipality",
+        "State",
+        "ZIP Code",
+        "Unit Type",
+        "Unit",
+        "Latitude",
+        "Longitude",
+        "BuildingKey",
+        "IsApartmentBuilding",
+        "Data Quality Flag",
+    ]
+    audit_df = addresses[audit_columns].copy()
+    return output_df, stats, audit_df
 
 
-# ======================================================================
+# =====================================================================
 # Streamlit interface
-# ======================================================================
+# =====================================================================
 st.set_page_config(
     page_title="TerritoryToolbox's NWS Importer",
     layout="centered",
@@ -598,14 +705,15 @@ st.set_page_config(
 
 st.title("TerritoryToolbox's NWS Importer")
 st.write(
-    "Upload the Address List CSV from TerritoryToolbox's Analysis Engine "
-    "and the matching NWS Territory Export CSV."
+    "Upload the complete Territory Analysis Excel workbook and the matching "
+    "NWS Territory Export file. The importer uses the Address List and Apartments "
+    "sheets as the source of truth."
 )
 
 SESSION_KEYS = [
     "nws_csv_data",
-    "nws_stats",
     "nws_audit_csv",
+    "nws_stats",
     "nws_processing_success",
 ]
 
@@ -613,45 +721,28 @@ if "nws_processing_success" not in st.session_state:
     st.session_state.nws_processing_success = False
 
 if not st.session_state.nws_processing_success:
-    with st.expander("Advanced Settings"):
-        apartment_threshold = st.selectbox(
-            "Apartment grouping threshold",
-            options=[3, 4, 5, 6],
-            index=0,
-            help=(
-                "A building is treated as an apartment when it contains at "
-                "least this many distinct unit identifiers."
-            ),
-        )
-
     col1, col2 = st.columns(2)
     with col1:
         uploaded_analysis = st.file_uploader(
-            "1. Upload Address List CSV",
-            type=["csv"],
+            "1. Upload Territory Analysis Workbook",
+            type=["xlsx", "xlsm", "xls"],
             key="analysis_upload",
         )
     with col2:
         uploaded_export = st.file_uploader(
-            "2. Upload NWS Territory Export CSV",
-            type=["csv"],
+            "2. Upload NWS Territory Export",
+            type=["xlsx", "xlsm", "xls", "csv"],
             key="export_upload",
         )
 
     if uploaded_analysis is not None and uploaded_export is not None:
         st.divider()
-
         if st.button("Generate NWS Import File", type="primary"):
-            with st.spinner(
-                "Validating territories, addresses, and apartment groups..."
-            ):
+            with st.spinner("Validating territory mappings, addresses, and apartment buildings..."):
                 try:
                     final_dataset, stats, audit_df = transform_territory_data(
-                        uploaded_analysis,
-                        uploaded_export,
-                        apartment_threshold=apartment_threshold,
+                        uploaded_analysis, uploaded_export
                     )
-
                     st.session_state.nws_csv_data = final_dataset.to_csv(
                         index=False
                     ).encode("utf-8-sig")
@@ -661,39 +752,37 @@ if not st.session_state.nws_processing_success:
                     st.session_state.nws_stats = stats
                     st.session_state.nws_processing_success = True
                     st.rerun()
-
-                except ValueError as error:
+                except ImportValidationError as error:
                     st.error(f"Validation Error: {error}")
                 except Exception as error:
                     st.error(
-                        "An unexpected processing error occurred. "
-                        "No import file was generated."
+                        "An unexpected processing error occurred. No import file was generated."
                     )
                     with st.expander("Technical Details"):
                         st.exception(error)
-
 else:
     stats = st.session_state.nws_stats
-
     st.success("NWS import file generated successfully.")
 
     st.subheader("Process Summary")
     summary = pd.DataFrame(
         {
             "Measure": [
-                "Input address rows",
+                "Input Address List rows",
                 "House rows generated",
                 "Apartment buildings",
-                "Apartment parent rows",
-                "Apartment child rows",
-                "Total export rows",
+                "Apartment parent rows generated",
+                "Apartment child rows generated",
+                "Source parent rows absorbed",
+                "Total NWS export rows",
             ],
             "Count": [
-                stats["input_addresses"],
-                stats["houses"],
+                stats["input_address_rows"],
+                stats["house_rows"],
                 stats["apartment_buildings"],
-                stats["apartment_parents"],
-                stats["apartment_children"],
+                stats["apartment_parent_rows"],
+                stats["apartment_child_rows"],
+                stats["source_parent_rows_ignored"],
                 stats["total_export_rows"],
             ],
         }
@@ -710,8 +799,8 @@ else:
 
     with st.expander("Technical Audit File"):
         st.write(
-            "This optional CSV contains the normalized and matched source rows "
-            "used to generate the import."
+            "This optional CSV contains the normalized and matched source rows used "
+            "to generate the NWS import."
         )
         st.download_button(
             label="Download Processing Audit CSV",
