@@ -624,41 +624,84 @@ def build_full_address(audit_df):
     return audit_df.apply(build_row, axis=1)
 
 
-def prepare_audit_sheet_dataframe(audit_df):
+def prepare_audit_sheet_dataframe(audit_df, sheet_name):
     """
-    Insert Full Address as Column B and move the original Column B to the end.
+    Prepare an audit dataframe for Excel.
+
+    Shared behavior:
+    - Insert Full Address as Column B.
+    - Move the original Column B to the end.
+
+    Sheet-specific behavior:
+    - Included Addresses: move IsApartmentBuilding to Column D.
+    - Excluded Addresses: move Exclusion Reason to Column C and
+      Data Quality Flag immediately after it as Column D.
     """
     result = audit_df.copy()
-    original_columns = result.columns.tolist()
 
-    if not original_columns:
+    if result.empty and len(result.columns) == 0:
         return result
 
+    original_columns = result.columns.tolist()
     original_second_column = (
         original_columns[1] if len(original_columns) > 1 else None
     )
-    first_column = original_columns[0]
 
     result.insert(1, "Full Address", build_full_address(result))
 
-    reordered_columns = [first_column, "Full Address"]
-    reordered_columns.extend(
-        column
-        for column in original_columns
-        if column not in {first_column, original_second_column}
+    if original_second_column is not None and original_second_column in result.columns:
+        moved_second_column = result.pop(original_second_column)
+        result.insert(len(result.columns), original_second_column, moved_second_column)
+
+    if sheet_name == "Included Addresses":
+        if "IsApartmentBuilding" in result.columns:
+            apartment_column = result.pop("IsApartmentBuilding")
+            result.insert(
+                min(3, len(result.columns)),
+                "IsApartmentBuilding",
+                apartment_column,
+            )
+
+    elif sheet_name == "Excluded Addresses":
+        if "Exclusion Reason" in result.columns:
+            exclusion_column = result.pop("Exclusion Reason")
+            result.insert(
+                min(2, len(result.columns)),
+                "Exclusion Reason",
+                exclusion_column,
+            )
+
+        if "Data Quality Flag" in result.columns:
+            quality_column = result.pop("Data Quality Flag")
+            result.insert(
+                min(3, len(result.columns)),
+                "Data Quality Flag",
+                quality_column,
+            )
+
+    return result
+
+
+def write_merged_rich_sentence(
+    worksheet,
+    first_row,
+    last_row,
+    segments,
+    formats,
+):
+    """
+    Merge Columns A and B across the requested row range and write a sentence
+    containing selectively bold text into the merged cell.
+    """
+    worksheet.merge_range(
+        first_row,
+        0,
+        last_row,
+        1,
+        "",
+        formats["merged"],
     )
-    if original_second_column is not None:
-        reordered_columns.append(original_second_column)
 
-    return result[reordered_columns]
-
-
-def write_rich_sentence(worksheet, row, segments, formats):
-    """
-    Write a sentence containing selectively bold text.
-
-    segments is a sequence of (text, is_bold) tuples.
-    """
     rich_parts = []
     for text, is_bold in segments:
         rich_parts.extend(
@@ -666,10 +709,10 @@ def write_rich_sentence(worksheet, row, segments, formats):
         )
 
     worksheet.write_rich_string(
-        row,
+        first_row,
         0,
         *rich_parts,
-        formats["normal"],
+        formats["merged"],
     )
 
 
@@ -681,8 +724,14 @@ def build_audit_workbook(
     exclusion_summary,
 ):
     """Generate the three-tab formatted NWS audit workbook."""
-    included_sheet_df = prepare_audit_sheet_dataframe(included_audit)
-    excluded_sheet_df = prepare_audit_sheet_dataframe(excluded_audit)
+    included_sheet_df = prepare_audit_sheet_dataframe(
+        included_audit,
+        "Included Addresses",
+    )
+    excluded_sheet_df = prepare_audit_sheet_dataframe(
+        excluded_audit,
+        "Excluded Addresses",
+    )
 
     input_count = int(stats["input_address_rows"])
     included_count = int(len(included_audit))
@@ -698,23 +747,43 @@ def build_audit_workbook(
     with pd.ExcelWriter(audit_buffer, engine="xlsxwriter") as writer:
         workbook = writer.book
 
-        # --------------------------------------------------------------
-        # Shared formats
-        # --------------------------------------------------------------
         title_format = workbook.add_format(
             {
                 "bold": True,
-                "font_size": 16,
+                "font_size": 24,
+                "font_color": "#046A34",
                 "align": "left",
                 "valign": "vcenter",
             }
         )
-        heading_format = workbook.add_format({"bold": True})
+        heading_format = workbook.add_format(
+            {
+                "bold": True,
+                "font_size": 14,
+                "align": "left",
+                "valign": "vcenter",
+            }
+        )
         normal_format = workbook.add_format(
-            {"align": "left", "valign": "top"}
+            {
+                "align": "left",
+                "valign": "top",
+                "text_wrap": True,
+            }
         )
         bold_format = workbook.add_format(
-            {"bold": True, "align": "left", "valign": "top"}
+            {
+                "bold": True,
+                "align": "left",
+                "valign": "top",
+            }
+        )
+        merged_format = workbook.add_format(
+            {
+                "align": "left",
+                "valign": "vcenter",
+                "text_wrap": True,
+            }
         )
         table_header_format = workbook.add_format(
             {
@@ -733,7 +802,18 @@ def build_audit_workbook(
                 "text_wrap": False,
             }
         )
-        formats = {"normal": normal_format, "bold": bold_format}
+        exclusion_table_body_format = workbook.add_format(
+            {
+                "align": "left",
+                "valign": "top",
+                "text_wrap": True,
+            }
+        )
+        formats = {
+            "normal": normal_format,
+            "bold": bold_format,
+            "merged": merged_format,
+        }
 
         # --------------------------------------------------------------
         # Tab 1: Summary
@@ -741,86 +821,97 @@ def build_audit_workbook(
         summary_sheet = workbook.add_worksheet("Summary")
         writer.sheets["Summary"] = summary_sheet
         summary_sheet.set_tab_color("#000000")
-        summary_sheet.set_column_pixels("A:A", 620)
-        summary_sheet.set_column_pixels("B:B", 125)
-        summary_sheet.set_row(0, 24)
 
-        row = 0
+        # Set only Columns A and B. Columns C:Z remain untouched and unfilled.
+        summary_sheet.set_column("A:A", 42)
+        summary_sheet.set_column("B:B", 28)
+        summary_sheet.set_row(0, 37.5)  # Approximately 50 pixels.
+
         summary_sheet.write(
-            row,
             0,
-            f"{congregation_name} NWS Import Auditing Report",
+            0,
+            f"{congregation_name} NWS IMPORT AUDITING REPORT".upper(),
             title_format,
         )
-        row += 2
 
-        summary_sheet.write(row, 0, "SUMMARY:", heading_format)
-        row += 2
+        # Row 3: SUMMARY:
+        summary_sheet.write(2, 0, "SUMMARY:", heading_format)
 
-        summary_sheet.write(
-            row,
-            0,
-            f"{input_count:,} address rows were pulled from your Territory Analysis file:",
-            normal_format,
-        )
-        row += 2
-
-        summary_sheet.write(
-            row,
-            0,
-            (
-                f"{included_count:,} source rows were included in the NWS "
-                f"import process ({included_percent:.3f}% included)."
-            ),
-            normal_format,
-        )
-        row += 2
-
-        summary_sheet.write(
-            row,
-            0,
-            (
-                f"{excluded_count:,} source rows were excluded because required "
-                f"address information was missing or invalid "
-                f"({excluded_percent:.3f}% excluded)."
-            ),
-            normal_format,
-        )
-        row += 2
-
-        summary_sheet.write(row, 0, "Included Addresses:", heading_format)
-        row += 2
-
-        write_rich_sentence(
+        # Rows 4-10 are fully occupied by three vertically merged summary blocks.
+        write_merged_rich_sentence(
             summary_sheet,
-            row,
+            3,
+            4,
+            [
+                (f"{input_count:,}", True),
+                (
+                    " address rows were pulled from your Territory Analysis file:",
+                    False,
+                ),
+            ],
+            formats,
+        )
+        write_merged_rich_sentence(
+            summary_sheet,
+            5,
+            6,
+            [
+                (f"{included_count:,}", True),
+                (
+                    " source rows were included in the NWS import process "
+                    f"({included_percent:.3f}% included).",
+                    False,
+                ),
+            ],
+            formats,
+        )
+        write_merged_rich_sentence(
+            summary_sheet,
+            7,
+            9,
+            [
+                (f"{excluded_count:,}", True),
+                (
+                    " source rows were excluded because required address "
+                    "information was missing or invalid "
+                    f"({excluded_percent:.3f}% excluded).",
+                    False,
+                ),
+            ],
+            formats,
+        )
+
+        # Row 11: INCLUDED ADDRESSES:
+        summary_sheet.write(10, 0, "INCLUDED ADDRESSES:", heading_format)
+
+        # Rows 12-20 are fully occupied by four vertically merged text blocks.
+        write_merged_rich_sentence(
+            summary_sheet,
+            11,
+            12,
             [
                 (f"{stats['house_rows']:,}", True),
                 (" rows were processed as houses.", False),
             ],
             formats,
         )
-        row += 2
-
-        write_rich_sentence(
+        write_merged_rich_sentence(
             summary_sheet,
-            row,
+            13,
+            15,
             [
-                (
-                    f"The importer found {stats['apartment_buildings']:,} "
-                    "apartment buildings containing ",
-                    False,
-                ),
+                ("The importer found ", False),
+                (f"{stats['apartment_buildings']:,}", True),
+                (" apartment buildings containing ", False),
                 (f"{stats['apartment_child_rows']:,}", True),
                 (" apartment-unit rows.", False),
             ],
             formats,
         )
-        row += 2
-
-        write_rich_sentence(
+        write_merged_rich_sentence(
             summary_sheet,
-            row,
+            16,
+            18,
             [
                 ("The importer absorbed ", False),
                 (f"{stats['source_parent_rows_ignored']:,}", True),
@@ -833,30 +924,30 @@ def build_audit_workbook(
             ],
             formats,
         )
-        row += 2
-
-        summary_sheet.write(
-            row,
-            0,
-            (
-                f"The final NWS import file contains "
-                f"{stats['total_export_rows']:,} rows, including "
-                f"{stats['apartment_parent_rows']:,} generated apartment "
-                "parent rows."
-            ),
-            normal_format,
+        write_merged_rich_sentence(
+            summary_sheet,
+            19,
+            19,
+            [
+                ("The final NWS import file contains ", False),
+                (f"{stats['total_export_rows']:,}", True),
+                (" rows, including ", False),
+                (f"{stats['apartment_parent_rows']:,}", True),
+                (" generated apartment parent rows.", False),
+            ],
+            formats,
         )
-        row += 2
 
+        # Row 21: EXCLUDED ADDRESSES heading.
         summary_sheet.write(
-            row,
+            20,
             0,
-            f"Excluded Addresses — {excluded_count:,} TOTAL:",
+            f"EXCLUDED ADDRESSES — {excluded_count:,} TOTAL:",
             heading_format,
         )
-        row += 2
 
-        exclusion_table_start = row
+        # Row 23: exclusion table header. Row 22 is retained as a visual divider.
+        exclusion_table_start = 22
         exclusion_summary.to_excel(
             writer,
             sheet_name="Summary",
@@ -869,32 +960,47 @@ def build_audit_workbook(
             exclusion_summary.columns.tolist(),
             table_header_format,
         )
-        if not exclusion_summary.empty:
-            summary_sheet.set_row(
-                exclusion_table_start,
-                None,
-                table_header_format,
-            )
-            summary_sheet.set_column_pixels("A:A", 620, table_body_format)
-            summary_sheet.set_column_pixels("B:B", 125, table_body_format)
 
-        footer_row = exclusion_table_start + len(exclusion_summary) + 3
-        summary_sheet.write(
+        for data_row in range(
+            exclusion_table_start + 1,
+            exclusion_table_start + 1 + len(exclusion_summary),
+        ):
+            summary_sheet.set_row(data_row, None, exclusion_table_body_format)
+
+        summary_sheet.set_column(
+            "A:A",
+            42,
+            exclusion_table_body_format,
+        )
+        summary_sheet.set_column(
+            "B:B",
+            28,
+            exclusion_table_body_format,
+        )
+
+        footer_row = exclusion_table_start + len(exclusion_summary) + 2
+        summary_sheet.merge_range(
             footer_row,
             0,
+            footer_row + 1,
+            1,
             (
                 "To review the specific excluded addresses, open the "
                 "'Excluded Addresses' tab; to include them in a future import, "
                 "correct the listed issues in your Territory Analysis Excel "
                 "report and regenerate the file."
             ),
-            normal_format,
+            merged_format,
         )
 
         # --------------------------------------------------------------
         # Shared detailed-sheet writer
         # --------------------------------------------------------------
-        def write_detail_sheet(sheet_name, dataframe, tab_color):
+        def write_detail_sheet(
+            sheet_name,
+            dataframe,
+            tab_color,
+        ):
             dataframe.to_excel(
                 writer,
                 sheet_name=sheet_name,
@@ -914,6 +1020,18 @@ def build_audit_workbook(
 
             for column_index, column_name in enumerate(dataframe.columns):
                 width_pixels = 350 if column_name == "Full Address" else 125
+
+                if (
+                    sheet_name == "Excluded Addresses"
+                    and column_name == "Exclusion Reason"
+                ):
+                    width_pixels = 450
+                elif (
+                    sheet_name == "Excluded Addresses"
+                    and column_name == "Data Quality Flag"
+                ):
+                    width_pixels = 250
+
                 worksheet.set_column_pixels(
                     column_index,
                     column_index,
@@ -922,17 +1040,18 @@ def build_audit_workbook(
                 )
 
         # --------------------------------------------------------------
-        # Tab 2 and Tab 3
+        # Tab 2: Included Addresses
+        # Tab 3: Excluded Addresses
         # --------------------------------------------------------------
-        write_detail_sheet(
-            "Excluded Addresses",
-            excluded_sheet_df,
-            "#F4CCCC",
-        )
         write_detail_sheet(
             "Included Addresses",
             included_sheet_df,
-            "#D9EAD3",
+            "#046A34",
+        )
+        write_detail_sheet(
+            "Excluded Addresses",
+            excluded_sheet_df,
+            "#C0504D",
         )
 
     return audit_buffer.getvalue()
@@ -1359,8 +1478,15 @@ def transform_territory_data(analysis_file, export_file):
         exclusion_summary=exclusion_summary,
     )
     audit_filename = f"{congregation_name}_NWS_Audit.xlsx"
+    csv_filename = f"{congregation_name}-NWSAddressImport-Ready.csv"
 
-    return output_df, stats, audit_workbook, audit_filename
+    return (
+        output_df,
+        stats,
+        audit_workbook,
+        audit_filename,
+        csv_filename,
+    )
 
 
 # =====================================================================
@@ -1380,6 +1506,7 @@ st.write(
 
 SESSION_KEYS = [
     "nws_csv_data",
+    "nws_csv_filename",
     "nws_audit_csv",
     "nws_audit_filename",
     "nws_stats",
@@ -1414,6 +1541,7 @@ if not st.session_state.nws_processing_success:
                         stats,
                         audit_workbook,
                         audit_filename,
+                        csv_filename,
                     ) = transform_territory_data(
                         uploaded_analysis,
                         uploaded_export,
@@ -1421,6 +1549,7 @@ if not st.session_state.nws_processing_success:
                     st.session_state.nws_csv_data = final_dataset.to_csv(
                         index=False
                     ).encode("utf-8-sig")
+                    st.session_state.nws_csv_filename = csv_filename
                     st.session_state.nws_audit_csv = audit_workbook
                     st.session_state.nws_audit_filename = audit_filename
                     st.session_state.nws_stats = stats
@@ -1440,7 +1569,7 @@ else:
     st.download_button(
         label="Download NWS Import CSV",
         data=st.session_state.nws_csv_data,
-        file_name="NWS_Address_Import_Ready.csv",
+        file_name=st.session_state.nws_csv_filename,
         mime="text/csv",
         type="primary",
     )
