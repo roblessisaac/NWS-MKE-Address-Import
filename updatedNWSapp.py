@@ -679,6 +679,31 @@ def prepare_audit_sheet_dataframe(audit_df, sheet_name):
                 quality_column,
             )
 
+    # Apply final positional changes after all named-column moves.
+    if sheet_name == "Included Addresses":
+        # Move current Column D to Column C.
+        if len(result.columns) >= 4:
+            column_d_name = result.columns[3]
+            column_d = result.pop(column_d_name)
+            result.insert(2, column_d_name, column_d)
+
+        # Switch current Columns I and J.
+        if len(result.columns) >= 10:
+            columns = result.columns.tolist()
+            columns[8], columns[9] = columns[9], columns[8]
+            result = result[columns]
+
+        # Omit the current Column S.
+        if len(result.columns) >= 19:
+            result = result.drop(columns=[result.columns[18]])
+
+    elif sheet_name == "Excluded Addresses":
+        # Switch current Columns J and K.
+        if len(result.columns) >= 11:
+            columns = result.columns.tolist()
+            columns[9], columns[10] = columns[10], columns[9]
+            result = result[columns]
+
     return result
 
 
@@ -792,7 +817,7 @@ def build_audit_workbook(
                 "font_color": "#EAECEB",
                 "align": "center",
                 "valign": "vcenter",
-                "text_wrap": False,
+                "text_wrap": True,
             }
         )
         table_body_format = workbook.add_format(
@@ -993,6 +1018,11 @@ def build_audit_workbook(
             merged_format,
         )
 
+        # Excel rows 29 and 30 are zero-indexed as 28 and 29.
+        # XlsxWriter uses points; 22.5 points is approximately 30 pixels.
+        summary_sheet.set_row(28, 22.5)
+        summary_sheet.set_row(29, 22.5)
+
         # --------------------------------------------------------------
         # Shared detailed-sheet writer
         # --------------------------------------------------------------
@@ -1021,7 +1051,9 @@ def build_audit_workbook(
             for column_index, column_name in enumerate(dataframe.columns):
                 width_pixels = 350 if column_name == "Full Address" else 125
 
-                if (
+                if sheet_name == "Included Addresses" and column_index == 0:
+                    width_pixels = 60
+                elif (
                     sheet_name == "Excluded Addresses"
                     and column_name == "Exclusion Reason"
                 ):
@@ -1037,6 +1069,23 @@ def build_audit_workbook(
                     column_index,
                     width_pixels,
                     table_body_format,
+                )
+
+            if sheet_name == "Included Addresses":
+                worksheet.set_column(
+                    4,
+                    8,
+                    None,
+                    None,
+                    {"hidden": True},
+                )
+            elif sheet_name == "Excluded Addresses":
+                worksheet.set_column(
+                    5,
+                    9,
+                    None,
+                    None,
+                    {"hidden": True},
                 )
 
         # --------------------------------------------------------------
@@ -1499,9 +1548,9 @@ st.set_page_config(
 
 st.title("TerritoryToolbox's NWS Importer")
 st.write(
-    "Upload the complete Territory Analysis Excel workbook and the matching "
-    "NWS Territory Export file. The importer uses the Address List and Apartments "
-    "sheets as the source of truth."
+    "Upload your complete “Territory Analysis Excel” file and your congregation’s "
+    "“NWS Territory Export” file. Both files are required. The importer will also "
+    "create an audit workbook so you can confirm that the data transferred correctly."
 )
 
 SESSION_KEYS = [
@@ -1520,7 +1569,7 @@ if not st.session_state.nws_processing_success:
     col1, col2 = st.columns(2)
     with col1:
         uploaded_analysis = st.file_uploader(
-            "1. Upload Territory Analysis Workbook",
+            "1. Upload Territory Analysis",
             type=["xlsx", "xlsm", "xls"],
             key="analysis_upload",
         )
@@ -1580,8 +1629,3 @@ else:
         file_name=st.session_state.nws_audit_filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-    if st.button("Process New Files"):
-        for key in SESSION_KEYS + ["analysis_upload", "export_upload"]:
-            st.session_state.pop(key, None)
-        st.rerun()
