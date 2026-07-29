@@ -1,5 +1,6 @@
 import io
 import re
+import unicodedata
 from pathlib import Path
 
 import pandas as pd
@@ -248,16 +249,119 @@ def normalize_address_component(series):
     )
 
 
-def extract_trailing_territory_number(series, label):
-    text = clean_text_series(series)
-    number_text = text.str.extract(r"(\d+)\s*$", expand=False)
-    invalid = number_text.isna()
-    if invalid.any():
+def parse_territory_name(value, label="Territory Name"):
+    """
+    Parse one human-readable territory value into its display name and number.
+
+    The value must end in exactly one integer. Everything before that integer
+    is treated as the display territory name. Formatting separators immediately
+    before the number are allowed, but malformed values are never repaired.
+    """
+    original = clean_scalar(value)
+    if not original:
+        raise ImportValidationError(f"{label} contains a blank territory name.")
+
+    # Capture the final integer without assuming a hyphen-based naming scheme.
+    match = re.fullmatch(r"\s*(?P<prefix>.*?)(?P<number>\d+)\s*", original)
+    if not match:
         raise ImportValidationError(
-            f"Some {label} values do not end in a territory number. Examples: "
-            + sample_values(text[invalid])
+            f"{label} must end in an integer territory number. Invalid value: {original}"
         )
-    return pd.to_numeric(number_text, errors="raise").astype("Int64")
+
+    raw_prefix = match.group("prefix").strip()
+    number_text = match.group("number")
+
+    # Remove only separators adjacent to the final number. This allows values
+    # such as "Hi-Mount 5" and "Hi.Mount-5" without changing the actual name.
+    parsed_name = raw_prefix.rstrip(" \t\r\n-–—_.,:;|/\\")
+    if not parsed_name:
+        raise ImportValidationError(
+            f"{label} must contain a display name before the territory number. "
+            f"Invalid value: {original}"
+        )
+
+    # A digit at the end of the parsed name means the source contained multiple
+    # trailing integer tokens, such as "Hi-Mount 5 6".
+    if parsed_name[-1].isdigit():
+        raise ImportValidationError(
+            f"{label} contains multiple trailing integers. Invalid value: {original}"
+        )
+
+    territory_number = int(number_text)
+    return parsed_name, territory_number
+
+
+def normalize_display_territory(value):
+    """
+    Create one Unicode-safe display key component.
+
+    The normalized value is uppercase and contains only Unicode letters and
+    digits. Whitespace, hyphens, and all punctuation are removed.
+    """
+    text = clean_scalar(value)
+    normalized = unicodedata.normalize("NFKC", text).upper()
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def build_normalized_display_key(display_name, territory_number):
+    """Build the canonical territory key used by both Analysis and NWS data."""
+    normalized_name = normalize_display_territory(display_name)
+    number_text = clean_scalar(territory_number)
+
+    if not normalized_name:
+        raise ImportValidationError("Display territory name is blank after normalization.")
+    if not re.fullmatch(r"\d+", number_text):
+        raise ImportValidationError(
+            f"Territory number must be an integer. Invalid value: {number_text or '<blank>'}"
+        )
+
+    # Integer conversion makes leading-zero variants such as 05 and 5 identical.
+    return f"{normalized_name}{int(number_text)}"
+
+
+def parse_territory_series(series, label):
+    """Parse and normalize a complete territory-name Series with clear examples."""
+    parsed_names = []
+    parsed_numbers = []
+    normalized_keys = []
+    errors = []
+
+    for value in series.tolist():
+        try:
+            parsed_name, parsed_number = parse_territory_name(value, label)
+            parsed_names.append(parsed_name)
+            parsed_numbers.append(parsed_number)
+            normalized_keys.append(
+                build_normalized_display_key(parsed_name, parsed_number)
+            )
+        except ImportValidationError as error:
+            errors.append(str(error))
+            parsed_names.append("")
+            parsed_numbers.append(pd.NA)
+            normalized_keys.append("")
+
+    if errors:
+        unique_errors = list(dict.fromkeys(errors))
+        raise ImportValidationError(
+            f"Some {label} values are malformed. Examples: "
+            + " | ".join(unique_errors[:8])
+        )
+
+    return (
+        pd.Series(parsed_names, index=series.index, dtype="object"),
+        pd.Series(parsed_numbers, index=series.index, dtype="Int64"),
+        pd.Series(normalized_keys, index=series.index, dtype="object"),
+    )
+
+
+def extract_trailing_territory_number(series, label):
+    """
+    Backward-compatible wrapper retained for apartment-processing code.
+
+    It uses the same strict territory parser as the display-key pipeline.
+    """
+    _, parsed_numbers, _ = parse_territory_series(series, label)
+    return parsed_numbers
 
 
 def build_building_key(house_number, street, municipality, postal_code):
@@ -290,8 +394,13 @@ def parse_apartment_base_addresses(apartments_df):
             + sample_values(base_text[invalid])
         )
 
-    apartments["TerritoryNumber"] = extract_trailing_territory_number(
-        apartments["Territory Name"], "Apartments sheet Territory Name"
+    (
+        apartments["Parsed Territory Name"],
+        apartments["TerritoryNumber"],
+        apartments["Normalized Display Territory Key"],
+    ) = parse_territory_series(
+        apartments["Territory Name"],
+        "Apartments sheet Territory Name",
     )
     apartments["ExpectedUnits"] = pd.to_numeric(apartments["Units"], errors="coerce").astype("Int64")
     invalid_units = apartments["ExpectedUnits"].isna() | apartments["ExpectedUnits"].lt(1)
@@ -306,7 +415,7 @@ def parse_apartment_base_addresses(apartments_df):
     )
 
     duplicate_keys = apartments.duplicated(
-        subset=["TerritoryNumber", "BuildingKey"], keep=False
+        subset=["Normalized Display Territory Key", "BuildingKey"], keep=False
     )
     if duplicate_keys.any():
         raise ImportValidationError(
@@ -317,6 +426,7 @@ def parse_apartment_base_addresses(apartments_df):
     return apartments[
         [
             "TerritoryNumber",
+            "Normalized Display Territory Key",
             "BuildingKey",
             "ExpectedUnits",
             "Base Address",
@@ -356,15 +466,6 @@ def prepare_export(export_df):
     export_df["CategoryCode"] = normalize_address_component(export_df["CategoryCode"])
     export_df["Category"] = clean_text_series(export_df["Category"])
 
-    number_text = clean_text_series(export_df["Number"])
-    invalid_numbers = ~number_text.str.fullmatch(r"\d+")
-    if invalid_numbers.any():
-        raise ImportValidationError(
-            "The NWS export contains blank or nonnumeric territory numbers. Examples: "
-            + sample_values(number_text[invalid_numbers])
-        )
-    export_df["Number"] = pd.to_numeric(number_text, errors="raise").astype("Int64")
-
     blank_ids = export_df["TerritoryID"].eq("")
     if blank_ids.any():
         raise ImportValidationError(
@@ -378,18 +479,50 @@ def prepare_export(export_df):
             + sample_values(export_df.loc[duplicate_ids, "TerritoryID"])
         )
 
-    # The new Territory Analysis carries only a trailing number, not CategoryCode.
-    # Therefore Number must be globally unique within the supplied export.
-    duplicate_numbers = export_df["Number"].duplicated(keep=False)
-    if duplicate_numbers.any():
-        rows = export_df.loc[duplicate_numbers, ["CategoryCode", "Number"]].astype(str).agg("-".join, axis=1)
+    blank_categories = export_df["Category"].eq("")
+    if blank_categories.any():
         raise ImportValidationError(
-            "The NWS export reuses the same territory Number in multiple rows, but the "
-            "Territory Analysis no longer contains CategoryCode. Ambiguous keys: "
-            + sample_values(rows)
+            f"The NWS export contains {int(blank_categories.sum())} row(s) "
+            "without a Category."
         )
 
-    return export_df[REQUIRED_EXPORT_COLUMNS].copy()
+    number_text = clean_text_series(export_df["Number"])
+    invalid_numbers = ~number_text.str.fullmatch(r"\d+")
+    if invalid_numbers.any():
+        raise ImportValidationError(
+            "The NWS export contains blank or nonnumeric territory numbers. Examples: "
+            + sample_values(number_text[invalid_numbers])
+        )
+    export_df["Number"] = pd.to_numeric(number_text, errors="raise").astype("Int64")
+
+    # Build the NWS-side key from the human-readable Category plus Number.
+    export_df["Normalized Display Territory Key"] = [
+        build_normalized_display_key(category, number)
+        for category, number in zip(export_df["Category"], export_df["Number"])
+    ]
+
+    duplicate_keys = export_df["Normalized Display Territory Key"].duplicated(
+        keep=False
+    )
+    if duplicate_keys.any():
+        duplicate_rows = (
+            export_df.loc[
+                duplicate_keys,
+                ["Category", "Number", "CategoryCode"],
+            ]
+            .astype(str)
+            .agg(" | ".join, axis=1)
+        )
+        raise ImportValidationError(
+            "The NWS export contains duplicate normalized display territories. "
+            "Each Category and Number combination must resolve to exactly one row. "
+            "Examples: "
+            + sample_values(duplicate_rows)
+        )
+
+    return export_df[
+        REQUIRED_EXPORT_COLUMNS + ["Normalized Display Territory Key"]
+    ].copy()
 
 
 def create_nws_row(row):
@@ -436,9 +569,18 @@ def transform_territory_data(analysis_file, export_file):
 
     addresses = addresses.copy()
     addresses["_SourceRow"] = range(2, len(addresses) + 2)
-    addresses["TerritoryNumber"] = extract_trailing_territory_number(
-        addresses["Territory Name"], "Address List Territory Name"
+
+    # Parse each Analysis territory strictly, then build the same canonical key
+    # used for the NWS Category + Number combination.
+    (
+        addresses["Parsed Territory Name"],
+        addresses["Parsed Territory Number"],
+        addresses["Normalized Display Territory Key"],
+    ) = parse_territory_series(
+        addresses["Territory Name"],
+        "Address List Territory Name",
     )
+    addresses["TerritoryNumber"] = addresses["Parsed Territory Number"]
 
     addresses["Full House Number"] = normalize_address_component(addresses["Full House Number"])
     addresses["Full Street"] = normalize_address_component(addresses["Full Street"])
@@ -505,14 +647,21 @@ def transform_territory_data(analysis_file, export_file):
                 + sample_values(addresses.loc[duplicate_source_ids, "Source Record ID"])
             )
 
-    addresses = addresses.merge(
-        export_df,
-        left_on="TerritoryNumber",
-        right_on="Number",
-        how="left",
-        validate="many_to_one",
-        suffixes=("", "_Export"),
-    )
+    # Match exclusively on the human-readable normalized display key.
+    # CategoryCode is copied from the matched NWS row only after linkage.
+    try:
+        addresses = addresses.merge(
+            export_df,
+            on="Normalized Display Territory Key",
+            how="left",
+            validate="many_to_one",
+            suffixes=("", "_Export"),
+        )
+    except pd.errors.MergeError as error:
+        raise ImportValidationError(
+            "One or more Analysis territories matched multiple NWS rows. "
+            "The NWS normalized display territory keys must be unique."
+        ) from error
 
     unmatched = addresses["TerritoryID"].isna()
     if unmatched.any():
@@ -522,17 +671,27 @@ def transform_territory_data(analysis_file, export_file):
             + sample_values(addresses.loc[unmatched, "Territory Name"])
         )
 
+    blank_matched_ids = clean_text_series(addresses["TerritoryID"]).eq("")
+    if blank_matched_ids.any():
+        raise ImportValidationError(
+            f"{int(blank_matched_ids.sum())} matched address row(s) have a blank TerritoryID."
+        )
+
     addresses["IsApartmentBuilding"] = addresses.set_index(
-        ["TerritoryNumber", "BuildingKey"]
+        ["Normalized Display Territory Key", "BuildingKey"]
     ).index.isin(
-        apartment_reference.set_index(["TerritoryNumber", "BuildingKey"]).index
+        apartment_reference.set_index(
+            ["Normalized Display Territory Key", "BuildingKey"]
+        ).index
     )
 
     # Every building listed on Apartments must exist in Address List.
-    present_keys = addresses[["TerritoryNumber", "BuildingKey"]].drop_duplicates()
+    present_keys = addresses[
+        ["Normalized Display Territory Key", "BuildingKey"]
+    ].drop_duplicates()
     apartment_presence = apartment_reference.merge(
         present_keys,
-        on=["TerritoryNumber", "BuildingKey"],
+        on=["Normalized Display Territory Key", "BuildingKey"],
         how="left",
         indicator=True,
     )
@@ -564,10 +723,22 @@ def transform_territory_data(analysis_file, export_file):
         "source_parent_rows_ignored": 0,
     }
 
-    group_keys = ["TerritoryID", "TerritoryNumber", "BuildingKey"]
-    apartment_lookup = apartment_reference.set_index(["TerritoryNumber", "BuildingKey"])
+    group_keys = [
+        "TerritoryID",
+        "TerritoryNumber",
+        "Normalized Display Territory Key",
+        "BuildingKey",
+    ]
+    apartment_lookup = apartment_reference.set_index(
+        ["Normalized Display Territory Key", "BuildingKey"]
+    )
 
-    for (_, territory_number, building_key), group in addresses.groupby(
+    for (
+        _,
+        territory_number,
+        normalized_display_key,
+        building_key,
+    ), group in addresses.groupby(
         group_keys, sort=False, dropna=False
     ):
         if not bool(group["IsApartmentBuilding"].iloc[0]):
@@ -579,7 +750,9 @@ def transform_territory_data(analysis_file, export_file):
                 stats["house_rows"] += 1
             continue
 
-        reference = apartment_lookup.loc[(territory_number, building_key)]
+        reference = apartment_lookup.loc[
+            (normalized_display_key, building_key)
+        ]
         unit_rows = group[group["Unit"].ne("")].copy()
         parent_source_rows = group[group["Unit"].eq("")].copy()
 
@@ -675,6 +848,9 @@ def transform_territory_data(analysis_file, export_file):
         "_SourceRow",
         "Source Record ID",
         "Territory Name",
+        "Parsed Territory Name",
+        "Parsed Territory Number",
+        "Normalized Display Territory Key",
         "TerritoryNumber",
         "TerritoryID",
         "CategoryCode",
