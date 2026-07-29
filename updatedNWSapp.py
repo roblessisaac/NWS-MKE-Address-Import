@@ -1,3 +1,4 @@
+import io
 import re
 import unicodedata
 from pathlib import Path
@@ -229,14 +230,13 @@ def require_columns(df, required, label):
 
 
 def normalize_zip(series):
-    postal = clean_text_series(series).str.replace(r"\s+", "", regex=True)
-    malformed = postal.ne("") & ~postal.str.fullmatch(r"\d{5}(?:-\d{4})?")
-    if malformed.any():
-        raise ImportValidationError(
-            "The Address List contains malformed ZIP codes. Examples: "
-            + sample_values(postal[malformed])
-        )
-    return postal
+    """
+    Normalize ZIP values without stopping the full import.
+
+    Blank or malformed ZIP codes are identified later as row-level exclusion
+    reasons so valid addresses can continue through the pipeline.
+    """
+    return clean_text_series(series).str.replace(r"\s+", "", regex=True)
 
 
 def normalize_address_component(series):
@@ -616,39 +616,43 @@ def transform_territory_data(analysis_file, export_file):
         addresses["ZIP Code"],
     )
 
-    critical_checks = {
-        "territory name": clean_text_series(addresses["Territory Name"]).eq(""),
-        "house number": addresses["Full House Number"].eq(""),
-        "street": addresses["Full Street"].eq(""),
-        "municipality": addresses["Municipality"].eq(""),
-        "state": addresses["State"].eq(""),
-        "ZIP code": addresses["ZIP Code"].eq(""),
-        "valid coordinates": (
+    # Address-quality failures exclude only the affected source rows.
+    # Territory matching remains blocking because the importer must never guess.
+    exclusion_checks = {
+        "Missing House Number": addresses["Full House Number"].eq(""),
+        "Missing Street": addresses["Full Street"].eq(""),
+        "Missing Municipality": addresses["Municipality"].eq(""),
+        "Missing State": addresses["State"].eq(""),
+        "Missing ZIP Code": addresses["ZIP Code"].eq(""),
+        "Malformed ZIP Code": (
+            addresses["ZIP Code"].ne("")
+            & ~addresses["ZIP Code"].str.fullmatch(r"\d{5}(?:-\d{4})?")
+        ),
+        "Invalid Coordinates": (
             addresses["Latitude"].isna()
             | addresses["Longitude"].isna()
             | ~addresses["Latitude"].between(-90, 90)
             | ~addresses["Longitude"].between(-180, 180)
         ),
     }
-    failures = [
-        f"{label}: {int(mask.sum())}"
-        for label, mask in critical_checks.items()
-        if mask.any()
-    ]
-    if failures:
-        raise ImportValidationError(
-            "The Address List contains rows that cannot produce a valid NWS import. "
-            + "; ".join(failures)
-            + "."
+
+    exclusion_reasons = pd.Series("", index=addresses.index, dtype="object")
+    for reason, mask in exclusion_checks.items():
+        exclusion_reasons.loc[mask] = exclusion_reasons.loc[mask].apply(
+            lambda existing: f"{existing}; {reason}" if existing else reason
         )
 
     flagged = addresses["Data Quality Flag"].ne("")
-    if flagged.any():
-        raise ImportValidationError(
-            f"The Address List contains {int(flagged.sum())} row(s) with Data Quality Flag values. "
-            "Resolve those records in the Analysis Engine before importing. Examples: "
-            + sample_values(addresses.loc[flagged, "Data Quality Flag"])
+    exclusion_reasons.loc[flagged] = [
+        f"{existing}; Data Quality Flag: {flag}"
+        if existing
+        else f"Data Quality Flag: {flag}"
+        for existing, flag in zip(
+            exclusion_reasons.loc[flagged],
+            addresses.loc[flagged, "Data Quality Flag"],
         )
+    ]
+    addresses["Exclusion Reason"] = exclusion_reasons
 
     if addresses["Source Record ID"].ne("").any():
         duplicate_source_ids = (
@@ -691,6 +695,15 @@ def transform_territory_data(analysis_file, export_file):
             f"{int(blank_matched_ids.sum())} matched address row(s) have a blank TerritoryID."
         )
 
+    excluded_addresses = addresses[addresses["Exclusion Reason"].ne("")].copy()
+    addresses = addresses[addresses["Exclusion Reason"].eq("")].copy()
+
+    if addresses.empty:
+        raise ImportValidationError(
+            "Every Address List row was excluded by address-quality validation. "
+            "No valid NWS import rows remain."
+        )
+
     addresses["IsApartmentBuilding"] = addresses.set_index(
         ["Normalized Display Territory Key", "BuildingKey"]
     ).index.isin(
@@ -729,7 +742,9 @@ def transform_territory_data(analysis_file, export_file):
 
     final_rows = []
     stats = {
-        "input_address_rows": len(addresses),
+        "input_address_rows": len(addresses) + len(excluded_addresses),
+        "included_address_rows": len(addresses),
+        "excluded_address_rows": len(excluded_addresses),
         "house_rows": 0,
         "apartment_buildings": 0,
         "apartment_parent_rows": 0,
@@ -738,7 +753,6 @@ def transform_territory_data(analysis_file, export_file):
         "excluded_apartment_buildings": 0,
         "excluded_apartment_rows": 0,
     }
-    addresses["Exclusion Reason"] = ""
 
     group_keys = [
         "TerritoryID",
@@ -899,8 +913,85 @@ def transform_territory_data(analysis_file, export_file):
         "IsApartmentBuilding",
         "Data Quality Flag",
     ]
-    audit_df = addresses[audit_columns].copy()
-    return output_df, stats, audit_df
+
+    included_audit = addresses[audit_columns].copy()
+
+    for column in ["Derived Unit Identifier", "IsApartmentBuilding"]:
+        if column not in excluded_addresses.columns:
+            excluded_addresses[column] = "" if column == "Derived Unit Identifier" else False
+    excluded_audit = excluded_addresses[audit_columns].copy()
+
+    # Apartment buildings rejected later in processing are already marked on
+    # the included working frame. Move them to the excluded audit tab.
+    apartment_excluded_mask = included_audit["Exclusion Reason"].ne("")
+    if apartment_excluded_mask.any():
+        excluded_audit = pd.concat(
+            [excluded_audit, included_audit.loc[apartment_excluded_mask]],
+            ignore_index=True,
+        )
+        included_audit = included_audit.loc[~apartment_excluded_mask].copy()
+
+    exclusion_summary = (
+        excluded_audit["Exclusion Reason"]
+        .value_counts()
+        .rename_axis("Exclusion Reason")
+        .reset_index(name="Rows")
+    )
+
+    process_summary = pd.DataFrame(
+        {
+            "Measure": [
+                "Input Address List rows",
+                "Included source rows",
+                "Excluded source rows",
+                "House rows generated",
+                "Apartment buildings",
+                "Apartment parent rows generated",
+                "Apartment child rows generated",
+                "Source parent rows absorbed",
+                "Excluded apartment buildings",
+                "Excluded apartment source rows",
+                "Total NWS export rows",
+            ],
+            "Count": [
+                stats["input_address_rows"],
+                len(included_audit),
+                len(excluded_audit),
+                stats["house_rows"],
+                stats["apartment_buildings"],
+                stats["apartment_parent_rows"],
+                stats["apartment_child_rows"],
+                stats["source_parent_rows_ignored"],
+                stats["excluded_apartment_buildings"],
+                stats["excluded_apartment_rows"],
+                stats["total_export_rows"],
+            ],
+        }
+    )
+    stats["included_address_rows"] = len(included_audit)
+    stats["excluded_address_rows"] = len(excluded_audit)
+
+    audit_buffer = io.BytesIO()
+    with pd.ExcelWriter(audit_buffer, engine="openpyxl") as writer:
+        process_summary.to_excel(writer, sheet_name="Summary", index=False)
+        exclusion_summary.to_excel(
+            writer,
+            sheet_name="Summary",
+            index=False,
+            startrow=len(process_summary) + 3,
+        )
+        included_audit.to_excel(
+            writer,
+            sheet_name="Included Addresses",
+            index=False,
+        )
+        excluded_audit.to_excel(
+            writer,
+            sheet_name="Excluded Addresses",
+            index=False,
+        )
+
+    return output_df, stats, audit_buffer.getvalue()
 
 
 # =====================================================================
@@ -948,15 +1039,13 @@ if not st.session_state.nws_processing_success:
         if st.button("Generate NWS Import File", type="primary"):
             with st.spinner("Validating territory mappings, addresses, and apartment buildings..."):
                 try:
-                    final_dataset, stats, audit_df = transform_territory_data(
+                    final_dataset, stats, audit_workbook = transform_territory_data(
                         uploaded_analysis, uploaded_export
                     )
                     st.session_state.nws_csv_data = final_dataset.to_csv(
                         index=False
                     ).encode("utf-8-sig")
-                    st.session_state.nws_audit_csv = audit_df.to_csv(
-                        index=False
-                    ).encode("utf-8-sig")
+                    st.session_state.nws_audit_csv = audit_workbook
                     st.session_state.nws_stats = stats
                     st.session_state.nws_processing_success = True
                     st.rerun()
@@ -977,6 +1066,8 @@ else:
         {
             "Measure": [
                 "Input Address List rows",
+                "Included source rows",
+                "Excluded source rows",
                 "House rows generated",
                 "Apartment buildings",
                 "Apartment parent rows generated",
@@ -988,6 +1079,8 @@ else:
             ],
             "Count": [
                 stats["input_address_rows"],
+                stats["included_address_rows"],
+                stats["excluded_address_rows"],
                 stats["house_rows"],
                 stats["apartment_buildings"],
                 stats["apartment_parent_rows"],
@@ -1015,10 +1108,10 @@ else:
             "to generate the NWS import."
         )
         st.download_button(
-            label="Download Processing Audit CSV",
+            label="Download Processing Audit Workbook",
             data=st.session_state.nws_audit_csv,
-            file_name="NWS_Address_Import_Audit.csv",
-            mime="text/csv",
+            file_name="NWS_Address_Import_Audit.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
     if st.button("Process New Files"):
